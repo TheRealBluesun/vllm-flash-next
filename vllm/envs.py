@@ -1215,6 +1215,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
     # (kernels: MacheteLinearKernel, MarlinLinearKernel, ExllamaLinearKernel)
+    # Local Flash-Next tuning toggles (see /opt/d/flash-next-perf/SUMMARY.md).
+    # Registered so they are part of the torch.compile cache key: several change
+    # the traced graph (narrow/small-FP8 GEMMs, qkv online quant).
+    "VLLM_PLE_PREFETCH": lambda: os.getenv("VLLM_PLE_PREFETCH", "0"),
+    "VLLM_PLE_TIMING": lambda: os.getenv("VLLM_PLE_TIMING", "0"),
+    "VLLM_PLE_PREFILL_HINT": lambda: os.getenv("VLLM_PLE_PREFILL_HINT", "0"),
+    "VLLM_PLE_NP_IDS": lambda: os.getenv("VLLM_PLE_NP_IDS", "0"),
+    "VLLM_DRAFT_VOCAB_FILE": lambda: os.getenv("VLLM_DRAFT_VOCAB_FILE", ""),
+    "VLLM_DRAFT_HEAD_FP8": lambda: os.getenv("VLLM_DRAFT_HEAD_FP8", "0"),
+    "VLLM_LM_HEAD_FP8": lambda: os.getenv("VLLM_LM_HEAD_FP8", "0"),
+    "VLLM_NARROW_GEMM": lambda: os.getenv("VLLM_NARROW_GEMM", "0"),
+    "VLLM_SMALL_FP8_LAYERS": lambda: os.getenv("VLLM_SMALL_FP8_LAYERS", ""),
+    "VLLM_QSA_QKV_ONLINE_QUANT": lambda: os.getenv("VLLM_QSA_QKV_ONLINE_QUANT", "0"),
     "VLLM_DISABLED_KERNELS": lambda: (
         []
         if "VLLM_DISABLED_KERNELS" not in os.environ
