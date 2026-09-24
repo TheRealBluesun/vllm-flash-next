@@ -1,5 +1,8 @@
 # Flash-Next tuning branch
 
+**Start with [`REPORT.md`](REPORT.md)**: full context (goal, every change and toggle, results,
+dead ends, where time goes, remaining levers, how to operate and measure, gotchas).
+
 Qwen3.8-Flash-Next (NVFP4) serving on a single RTX PRO 6000 (SM120), with the
 ~48 GB FP8 n-gram (PLE) table in **pageable** host memory: partly in swap, not pinned.
 
@@ -8,14 +11,14 @@ the commits below. That fork's CPU-worker PLE offload is the only upstream-deriv
 design that works with a swappable table. Upstream main moved to pinned-memory UVA
 offload (vllm-project/vllm#54371), which can't page out.
 
-Results vs. the same tree untuned (single stream, see `SUMMARY.md`):
+Results vs. the same tree untuned (single stream, `tools/bench.py`, medians):
 
-| Prompt | Prefill tok/s | TTFT | Decode tok/s |
-|---|---|---|---|
-| 1K | 5.8K → 9.3K | 0.18 → 0.11 s | 143 → 224 |
-| 8K | 7.6K → 12.3K | 1.08 → 0.67 s | 149 → 229 |
-| 32K | 7.8K → 12.7K | 4.23 → 2.58 s | 153 → 270 |
-| 100K | 8.1K → 12.8K | 12.6 → 8.0 s | 196 → 302 |
+| | Baseline | Final |
+|---|---|---|
+| Prefill 1K / 8K / 32K / 100K (tok/s) | 5.8K / 7.6K / 7.8K / 7.9K | 10.1K / 12.1K / 12.9K / 12.9K |
+| Time to first token, 100K | 13.0 s | 8.0 s |
+| Chat decode, short / code / prose (tok/s) | 195 / 197 / 125 | 311 / 367 / 217 |
+| Time per decode step | 19.0 ms | ~11.4–11.6 ms |
 
 Quality: ~+0.4–0.6% perplexity, from the FP8 weights only.
 
@@ -30,6 +33,12 @@ Quality: ~+0.4–0.6% perplexity, from the FP8 weights only.
 | Narrow split-K GEMM; small-layer W8A16 | `VLLM_NARROW_GEMM`, `VLLM_SMALL_FP8_LAYERS` (not recommended) |
 | QSA qkv_proj online quant | `VLLM_QSA_QKV_ONLINE_QUANT` |
 | Register the toggles in the compile cache key | — |
+| Online quant for the MTP draft layer | `VLLM_DRAFT_ONLINE_QUANT` |
+| Fused HC mix op (off), draft-pass PLE hints (off) | `VLLM_HC_FUSED`, `VLLM_PLE_DRAFT_HINT` |
+| PDL weight-prefetch GEMV + PDL-friendly neighbours | `VLLM_PDL_GEMV` |
+| L2-resident draft layer (eviction hints); CUDA TMA GEMV (off) | `VLLM_L2_DRAFT`, `VLLM_PDL_GEMV_CUDA` |
+| Fused MoE routing kernel | `VLLM_FUSED_ROUTE` |
+| Pure-Python PLE n-gram ids; prefetch threshold (off) | `VLLM_PLE_PY_IDS`, `VLLM_PLE_PREFETCH_MIN_ROWS` |
 
 ## Layout
 
@@ -42,7 +51,8 @@ Quality: ~+0.4–0.6% perplexity, from the FP8 weights only.
   chat-corpus generator for the hot-token vocab, and the NumPy-ids fuzz test.
 - `data/`: the 98K hot-token draft vocab and quality reference outputs.
 - `results/`: raw `bench.py` runs (baseline, tuned, final).
-- `SUMMARY.md` (overview) and `FINDINGS.md` (full log, including rejected ideas).
+- `REPORT.md` (full report, start here), `ROADMAP.md` (items, estimates, status, details),
+  `SUMMARY.md` (overnight snapshot) and `FINDINGS.md` (chronological log, including rejected ideas).
 
 ## Reproducing
 

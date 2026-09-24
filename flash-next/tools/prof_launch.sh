@@ -2,7 +2,7 @@
 # Launch the serve script under nsys with the service drop-in's environment.
 # Usage: prof_launch.sh OUTDIR
 set -euo pipefail
-OUT="$1"; mkdir -p "$OUT"
+OUT="$(realpath -m "$1")"; mkdir -p "$OUT"
 while IFS= read -r line; do
   if [[ "$line" =~ ^Environment=(.*)$ ]]; then kv="${BASH_REMATCH[1]}"; kv="${kv#\"}"; kv="${kv%\"}"; export "$kv"; fi
 done < <(cat "$HOME"/.config/systemd/user/vllm-flash-next.service.d/*.conf)
