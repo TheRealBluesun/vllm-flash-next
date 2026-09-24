@@ -22,6 +22,8 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+import os
+
 import torch
 from torch import nn
 
@@ -35,6 +37,7 @@ from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from .ops.hc_fused import hc_fused_mix
 from .ops.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -47,6 +50,9 @@ from .ops.hc import (
 # ---------------------------------------------------------------------------
 # Gated-residual variant
 # ---------------------------------------------------------------------------
+_HC_FUSED = os.environ.get("VLLM_HC_FUSED", "0") == "1"
+
+
 class GatedResidual(nn.Module):
     """Gated HyperConnection with learnable low-rank mixing and injection.
 
@@ -135,6 +141,15 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        if self.use_combine and _HC_FUSED:
+            block_input, injection = hc_fused_mix(
+                xn,
+                self.input_mix_weight_down_block_inject.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.lora_rank,
+            )
+            return hidden_states, block_input, injection
         if self.use_combine:
             # produce injection logits for combine
             split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
@@ -172,6 +187,15 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        if self.use_combine and _HC_FUSED:
+            block_input, injection = hc_fused_mix(
+                xn,
+                self.input_mix_weight_down_block_inject.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.lora_rank,
+            )
+            return hidden_states, block_input, injection
         if self.use_combine:
             # produce injection logits for combine
             split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
