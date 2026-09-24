@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import replace
@@ -185,6 +186,7 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
+        self._init_draft_vocab_head()
 
         all_attn_layers = set[str](
             get_layers_from_vllm_config(
@@ -356,7 +358,79 @@ class DraftModelSpeculator(BaseSpeculator):
             "(communication: O(2*tp_size) vs O(vocab_size))."
         )
 
+    def _init_draft_vocab_head(self) -> None:
+        """Optional reduced-vocabulary head for greedy drafting (FR-Spec style).
+
+        ``VLLM_DRAFT_VOCAB_FILE`` names a .npy of token ids. Greedy drafts are
+        then the argmax over that subset only, so each draft step reads a
+        fraction of the full lm_head. Drafts are always verified by the target,
+        so this can only change the acceptance rate, never the output.
+        """
+        self._draft_head_weight: torch.Tensor | None = None
+        self._draft_head_ids: torch.Tensor | None = None
+        self._fp8_draft_head = None
+        if (
+            os.environ.get("VLLM_DRAFT_HEAD_FP8", "0") == "1"
+            and self.speculative_config.draft_sample_method != "probabilistic"
+            and not self.use_local_argmax_reduction
+        ):
+            weight = getattr(getattr(self.model, "lm_head", None), "weight", None)
+            if weight is not None and weight.dim() == 2 and weight.is_cuda:
+                from vllm.v1.worker.gpu.spec_decode.fp8_draft_head import Fp8DraftHead
+
+                vocab_path = os.environ.get("VLLM_DRAFT_VOCAB_FILE")
+                if vocab_path:
+                    # FP8 over a hot-token subset; argmax index maps back via ids.
+                    ids = torch.from_numpy(np.load(vocab_path).astype(np.int64)).to(
+                        weight.device
+                    )
+                    self._draft_head_ids = ids
+                    self._fp8_draft_head = Fp8DraftHead(weight.index_select(0, ids))
+                    if os.environ.get("VLLM_LM_HEAD_FP8", "0") == "1":
+                        # The target needs the full vocabulary: separate copy.
+                        self.model.lm_head._fp8_head = Fp8DraftHead(
+                            weight[: self.vocab_size]
+                        )
+                else:
+                    self._fp8_draft_head = Fp8DraftHead(weight[: self.vocab_size])
+                    # Shared with the target's LogitsProcessor (VLLM_LM_HEAD_FP8).
+                    self.model.lm_head._fp8_head = self._fp8_draft_head
+                logger.info(
+                    "Greedy drafting with an FP8 lm_head copy (%d rows, %.0f MB)",
+                    self._fp8_draft_head.n,
+                    self._fp8_draft_head.weight.numel() / 1e6,
+                )
+                return
+        path = os.environ.get("VLLM_DRAFT_VOCAB_FILE")
+        if not path or self.speculative_config.draft_sample_method == "probabilistic":
+            return
+        lm_head = getattr(self.model, "lm_head", None)
+        weight = getattr(lm_head, "weight", None)
+        if (
+            weight is None
+            or weight.dim() != 2
+            or weight.shape[0] != self.vocab_size
+            or self.use_local_argmax_reduction
+        ):
+            logger.warning("Draft vocab subset unsupported for this drafter; ignored")
+            return
+        ids = torch.from_numpy(np.load(path).astype(np.int64)).to(weight.device)
+        self._draft_head_ids = ids
+        self._draft_head_weight = weight.index_select(0, ids).contiguous()
+        logger.info(
+            "Greedy drafting over a %d-token vocab subset (%.0f MB head, from %s)",
+            ids.numel(),
+            self._draft_head_weight.numel() * self._draft_head_weight.element_size() / 1e6,
+            path,
+        )
+
     def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._fp8_draft_head is not None:
+            top = self._fp8_draft_head.logits(hidden_states).argmax(dim=-1)
+            return top if self._draft_head_ids is None else self._draft_head_ids[top]
+        if self._draft_head_weight is not None:
+            logits = torch.nn.functional.linear(hidden_states, self._draft_head_weight)
+            return self._draft_head_ids[logits.argmax(dim=-1)]
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
         logits = self.model.compute_logits(hidden_states)

@@ -5,6 +5,8 @@
 from collections.abc import Callable
 from functools import cache
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -24,6 +26,8 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 
 logger = init_logger(__name__)
+
+_LM_HEAD_FP8 = os.environ.get("VLLM_LM_HEAD_FP8", "0") == "1"
 
 
 @cache
@@ -140,6 +144,19 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
+        fp8_head = getattr(lm_head, "_fp8_head", None)
+        if (
+            fp8_head is not None
+            and _LM_HEAD_FP8
+            and embedding_bias is None
+            and hidden_states.dim() == 2
+            and hidden_states.shape[0] <= 64
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            # Opt-in (VLLM_LM_HEAD_FP8=1): decode-sized batches read the FP8
+            # copy built for greedy drafting; halves lm_head DRAM traffic.
+            logger.info_once("Target lm_head using the FP8 copy for decode batches")
+            return fp8_head.logits(hidden_states).to(hidden_states.dtype)
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
             return lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias
