@@ -25,6 +25,9 @@ sampling + inter-graph gaps ~1.5.
 | 6b | FP8 for the MTP draft layer (dense + experts) | the draft's quant config never got --quantization-config; `VLLM_DRAFT_ONLINE_QUANT=1` attaches the target's online spec + FP8-block experts (target NVFP4 untouched) | **+3% measured** (12.6 → 12.3 ms/step; sampled chat 240–254 → 252–266) | ~30 min | none (drafts are verified) | **adopted 2026-09-24** |
 | 7 | Sampling/rejection in CUDA graphs | prof6: ~0.70 ms/step of launch gaps inside eager sections + 0.21 ms between graphs; vLLM has no sampler-capture option, so it means per-shape graphs around MRV2 sampling (CPU-side branching on sampling params) | ≤5–7% if all gaps vanish | several hours, intrusive | none, but correctness-sensitive | **scoped 2026-09-24, deferred** |
 | 8 | Better drafter (EAGLE-3/DFlash-style) | **Evidence against (2026-09-24):** PixelML trained a 5-layer DFlash drafter on ~98.5K on-policy Flash-Next conversations (`PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash`): only +3.87% aggregate vs native MTP k=4 (CI +2.1..+5.8%), "a maths drafter, a code wash, and it makes chat slower at every block size". Native MTP is "trained with multi-steps" and already accepts ~3.37 at k=4. | ≤ ~4%, negative on chat | many hours of GPU time | none | **not pursued** (only upside left: fine-tune MTP on own chat traffic, which needs a training implementation of the full MTP layer) |
+| 10 | **A. PDL weight-prefetch GEMV** (hand-written kernels, level 1) | split-K W8A16/BF16 GEMV that loads its weight tile *before* `griddepcontrol.wait` and triggers dependents early, so kernel N+1 streams weights while N finishes; replaces Marlin FP8 dense + cuBLAS HC/small BF16 GEMMs at decode sizes (M ≤ 64) | prototype chain 1.22× (78.2% vs 64.2% of DRAM roofline) on ~4.1 ms/step of critical path → **~0.7 ms (~5–6%)**, less if neighbours don't trigger PDL | ~1–1.5 h | low (numerics = FP8/BF16 rounding) | **in progress 2026-09-24** |
+| 10b | **B. CUDA C++ version of 10** | same kernel with TMA bulk loads (`cp.async.bulk`), persistent CTAs and PDL; target 85–90% of roofline on the chain | unknown; each +5% of roofline on ~4 ms ≈ +0.2 ms/step | ~1–2 h to prototype | low | planned (after 10 shows how much survives in the server) |
+| 10c | **C. L2-resident draft layer** (level 2) | `cudaAccessPolicyWindow` / `cudaLimitPersistingL2CacheSize` on the MTP layer's dense weights (~tens of MB of the 128 MB L2) so passes 2–4 of the 4 draft passes hit L2 instead of DRAM; needs the window set on the graph kernel nodes (stream attrs aren't captured) | ~3–5% (draft passes ≈2.1 ms/step) | ~30 min | none | planned |
 | 9 | Megakernel (persistent decoder-layer kernel) | route to 70–80% of roofline | up to 30–40% | months | none | |
 
 Prefill: FlashInfer CUTLASS NVFP4 MoE gives +12% prefill but −11% decode, and both
@@ -47,6 +50,22 @@ reduce + silu + cuBLAS up 5.94 (roofline 3.66) + gate_mix ~1.1, with the small k
 overlapped by PDL. Fused best: combine_norm 1.3 + K1 6.4 + K2c 6.1 ≈ 13.8 µs. K2 without stream
 splitting was *slower* than cuBLAS (rank 320 pads to 512 in `tl.arange`, and only 160 CTAs).
 The Triton GEMVs top out ~55–60% of DRAM BW on these ~7 MB matrices.
+
+## Hand-written kernel prototype (2026-09-24, `tools/pdl_chain_proto.py`, `tools/pdl_chain_sweep.py`)
+Chain of 24 × {qkvz FP8 16384×2560, out FP8 2560×6144, hcdn BF16 336×10240, hcup BF16 10240×320}
+= 96 dependent GEMVs, 1.71 GB weights, M=5, CUDA graph; roofline 953 µs at 1.79 TB/s.
+
+| variant | µs | % of roofline |
+|---|---|---|
+| ref: Marlin W8A16 + cuBLAS (production) | 1484 | 64.2% |
+| Triton split-K GEMV, no PDL | 1409 | 67.7% |
+| same + PDL weight prefetch (default tiles) | 1305 | 73.0% |
+| same + per-shape tiles | **1218** | **78.2%** |
+
+Best tiles (BLOCK_N, BLOCK_K, warps), one K-chunk per CTA: qkvz (64,512,8), out (64,512,8),
+hcdn (32,128,4), hcup (32,256,4). The win is the overlap: weights for kernel N+1 are in flight
+while kernel N's tail CTAs and split-K finalize run. Levels beyond: 10b (CUDA/TMA), 10c (L2
+residency), then #9 (megakernel) — each moves the step closer to one continuous weight stream.
 
 ## Side fixes
 - 2026-09-24: online FP8 was also quantizing the **vision tower** (Marlin pads its K=4304).
