@@ -11,6 +11,8 @@ kernel reaches ~90% of DRAM bandwidth for [M<=16, 2560] x [248320, 2560].
 
 import torch
 
+import vllm.envs as envs
+
 from vllm.triton_utils import tl, triton
 
 
@@ -19,6 +21,7 @@ def _w8a16_logits_kernel(
     x_ptr, w_ptr, s_ptr, y_ptr, M, N, K,
     stride_xm, stride_wn, stride_ym,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    EVICT_FIRST: tl.constexpr = False,
 ):
     pid_n = tl.program_id(0)
     offs_m = tl.arange(0, BLOCK_M)
@@ -35,6 +38,7 @@ def _w8a16_logits_kernel(
             w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
             mask=(offs_n[:, None] < N) & (offs_k[None, :] < K),
             other=0.0,
+            eviction_policy="evict_first" if EVICT_FIRST else "",
         )
         acc += tl.dot(x, tl.trans(w.to(tl.bfloat16)))
     s = tl.load(s_ptr + offs_n, mask=offs_n < N, other=0.0)
@@ -71,6 +75,7 @@ class Fp8DraftHead:
             x, self.weight, self.scale, y, m, self.n, self.k,
             x.stride(0), self.weight.stride(0), y.stride(0),
             BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=128,
+            EVICT_FIRST=envs.VLLM_L2_DRAFT,  # heads stream 250-630 MB: keep L2 for the draft layer
             num_warps=4, num_stages=4,
         )
         return y

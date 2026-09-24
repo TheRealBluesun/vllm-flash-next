@@ -34,6 +34,11 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.allocation import set_triton_allocator
+
+# VLLM_L2_DRAFT: expert weights stream with evict_first so the MTP draft layer's
+# dense weights stay in L2 between draft passes (Flash-Next: only the draft
+# layer uses this Triton MoE; the target experts run on Marlin).
+_L2_DRAFT = tl.constexpr(envs.VLLM_L2_DRAFT)
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -527,14 +532,16 @@ def fused_moe_kernel(
             a_mask = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & token_mask[None, :]
             b_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
             a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            b = tl.load(b_ptrs, mask=b_mask, other=0.0,
+                        eviction_policy="evict_first" if _L2_DRAFT else "")
         else:
             a = tl.load(
                 a_ptrs,
                 mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0,
+                        eviction_policy="evict_first" if _L2_DRAFT else "")
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)

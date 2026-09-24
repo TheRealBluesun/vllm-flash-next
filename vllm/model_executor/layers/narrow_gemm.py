@@ -129,9 +129,9 @@ def pdl_unquantized_gemm(
         return torch.nn.functional.linear(x, weight, bias)
     if weight.shape[0] <= NARROW_MAX_N and os.environ.get("VLLM_NARROW_GEMM", "0") == "1":
         return narrow_unquantized_gemm(layer, x, weight, bias)
-    from vllm.model_executor.layers.pdl_gemv import pdl_bf16_linear
+    from vllm.model_executor.layers.pdl_gemv import evict_policy, pdl_bf16_linear
 
-    return pdl_bf16_linear(x, weight)
+    return pdl_bf16_linear(x, weight, evict_policy(layer))
 
 # ---------------------------------------------------------------------------
 # Opt-in FP8 (per-row scale) copies for small BF16 layers at decode sizes.

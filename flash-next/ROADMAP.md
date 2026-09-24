@@ -26,8 +26,8 @@ sampling + inter-graph gaps ~1.5.
 | 7 | Sampling/rejection in CUDA graphs | prof6: ~0.70 ms/step of launch gaps inside eager sections + 0.21 ms between graphs; vLLM has no sampler-capture option, so it means per-shape graphs around MRV2 sampling (CPU-side branching on sampling params) | ≤5–7% if all gaps vanish | several hours, intrusive | none, but correctness-sensitive | **scoped 2026-09-24, deferred** |
 | 8 | Better drafter (EAGLE-3/DFlash-style) | **Evidence against (2026-09-24):** PixelML trained a 5-layer DFlash drafter on ~98.5K on-policy Flash-Next conversations (`PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash`): only +3.87% aggregate vs native MTP k=4 (CI +2.1..+5.8%), "a maths drafter, a code wash, and it makes chat slower at every block size". Native MTP is "trained with multi-steps" and already accepts ~3.37 at k=4. | ≤ ~4%, negative on chat | many hours of GPU time | none | **not pursued** (only upside left: fine-tune MTP on own chat traffic, which needs a training implementation of the full MTP layer) |
 | 10 | **A. PDL weight-prefetch GEMV** (hand-written kernels, level 1) | split-K W8A16/BF16 GEMV that loads its weight tile *before* `griddepcontrol.wait` and triggers dependents early, so kernel N+1 streams weights while N finishes; replaces Marlin FP8 dense + cuBLAS HC/small BF16 GEMMs at decode sizes (M ≤ 64) | prototype chain 1.22× (78.2% vs 64.2% of DRAM roofline) on ~4.1 ms/step of critical path → **~0.7 ms (~5–6%)**, less if neighbours don't trigger PDL | ~1–1.5 h | low (numerics = FP8/BF16 rounding) | **adopted 2026-09-24 as `VLLM_PDL_GEMV=1`: −0.5 ms/step corpus, −0.8 chat (≈ −4…−6%)**; C=1/2/4 270/427/595 tok/s; NLL within noise; costs 2.7 GB KV (280K → 200K tokens) |
-| 10b | **B. CUDA C++ version of 10** | same kernel with TMA bulk loads (`cp.async.bulk`), persistent CTAs and PDL; target 85–90% of roofline on the chain | unknown; each +5% of roofline on ~4 ms ≈ +0.2 ms/step | ~1–2 h to prototype | low | planned (after 10 shows how much survives in the server) |
-| 10c | **C. L2-resident draft layer** (level 2) | `cudaAccessPolicyWindow` / `cudaLimitPersistingL2CacheSize` on the MTP layer's dense weights (~tens of MB of the 128 MB L2) so passes 2–4 of the 4 draft passes hit L2 instead of DRAM; needs the window set on the graph kernel nodes (stream attrs aren't captured) | ~3–5% (draft passes ≈2.1 ms/step) | ~30 min | none | planned |
+| 10b | **B. CUDA C++ version of 10** | `pdl_ext/gemv_tma.cu`: 2D tensor-map TMA ring (2 stages × 2 boxes, 128B swizzle, `.shared::cta`), `mma.m16n8k16` bf16 with exact e4m3→bf16, intra-CTA split-K for few-row layers, PDL | isolated chains (M=5): qkvz 89% of roofline (Triton 78%), out 80% (77), HC down 77% (71), HC up 97% (74) → −9% GEMV time; **server: no measurable gain** (neighbours break the PDL chain, and unchained it's no faster than Triton) | ~2 h | none (numerics better than Triton) | **built 2026-09-24, off** (`VLLM_PDL_GEMV_CUDA=1`) |
+| 10c | **C. L2-resident draft layer** (level 2) | eviction hints instead of the persistence API: target GEMVs, both FP8 heads and the draft's Triton MoE load weights with `evict_first`, so the draft layer's ~118 MB stays in L2 across its 4 passes | sim: 381 → 215 µs of draft GEMVs per step; **server: −0.07 ms/step (~0.6%)** | ~45 min | none (same math) | **adopted 2026-09-24** (`VLLM_L2_DRAFT=1`) |
 | 9 | Megakernel (persistent decoder-layer kernel) | route to 70–80% of roofline | up to 30–40% | months | none | |
 
 Prefill: FlashInfer CUTLASS NVFP4 MoE gives +12% prefill but −11% decode, and both
@@ -86,6 +86,32 @@ residency), then #9 (megakernel) — each moves the step closer to one continuou
   Sampled chat 259–269 → 272–277 tok/s. Quality: short NLL +0.27/+0.35% (noise ±0.3%),
   long +0.80% (noise ±0.2%, earlier same-math runs +0.58/+0.87).
 - The first version was 0.84× — the block-scale gather loaded a fp32 scale per weight element.
+
+### #10c details (L2 residency, `tools/l2_draft_sim.py`)
+- The draft layer's dense weights are ~118 MB per pass (63 MB FP8 + 55 MB BF16), plus ~50 MB of experts
+  and the 251 MB FP8 draft head. Passes 2–4 already hit L2 when nothing runs between them.
+- `evict_last` on the draft weights gives no protection. What matters is that everything else streams
+  with `evict_first`: even 31 MB of normal-policy traffic between passes undoes most of the benefit.
+- Implemented without the persistence API (which CUDA graphs don't capture): per-load eviction hints in
+  `pdl_gemv` (target layers `evict_first`, draft modules tagged `_pdl_draft` keep the default),
+  `fp8_draft_head.py` (both heads) and the Triton `fused_moe` B loads (only the draft uses Triton MoE).
+  The server gain is smaller than the sim's, since some remaining kernels between passes still use the
+  default policy.
+
+### #10b details (CUDA GEMV, `tools/gemv_tma_test.py`)
+- Path to 89%: 1D per-row bulk copies (128–256 B) were limited by the TMA *op rate* (~1 copy / 130 clk / SM),
+  giving 19–25% of roofline → 2D tensor-map boxes [rows][128 B] with 128B swizzle (conflict-free
+  fragment reads) → x read from global/L1 instead of smem (3× occupancy) → 2 stages × 16 KB →
+  fewest global K-splits (atomics + ticket + finalize cost more than the lost parallelism), grid capped
+  at resident CTAs (2/SM), and intra-CTA split-K (8/16-row tiles, smem reduction) for few-row layers.
+- **sm_120 gotcha:** `cp.async.bulk{.tensor}` with a `.shared::cluster` destination compiles to a native
+  copy plus a guarded call to `__cuda_syscall_cp_async_bulk_*` (the remote-CTA fallback). Its presence
+  makes the driver raise the per-thread stack to 14.6 KB → **3.6 GB of VRAM reserved** at the first
+  launch. Use `.shared::cta` destinations (PTX 8.6).
+- Why no server gain: in a chain where a non-PDL kernel follows each GEMV (tools/pdl_gemv_test.py),
+  CUDA and Triton tie (1476 vs 1481 µs). The advantage only shows when neighbours chain via PDL, and
+  in the decode path most GEMVs border inductor elementwise kernels or Marlin MoE. Next lever: fuse or
+  PDL-enable those neighbours (or go to #9, the megakernel), then turn this kernel on.
 
 ## Side fixes
 - 2026-09-24: online FP8 was also quantizing the **vision tower** (Marlin pads its K=4304).

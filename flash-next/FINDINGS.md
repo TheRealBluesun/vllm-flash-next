@@ -183,3 +183,8 @@ happened only while an instance was still starting up or had crashed.
   GEMV for FP8 dense + wide BF16 linears, early PDL triggers in the HC kernels, PDL copy of the
   GDN post-conv kernel. −0.5/−0.8 ms/step (corpus/chat), C=1/2/4 270/427/595 tok/s, NLL within
   noise, −2.7 GB KV. Details in ROADMAP.md (#10).
+- 10c adopted (`VLLM_L2_DRAFT=1`): evict_first hints on streamed weights keep the draft layer in L2;
+  −0.07 ms/step. 10b built (`VLLM_PDL_GEMV_CUDA`, TMA + mma CUDA GEMV, 89/80/77/97% of roofline on
+  qkvz/out/HC-down/HC-up vs Triton 78/77/71/74) but no server gain because most neighbours aren't
+  PDL-chained; off. sm_120 gotcha: `.shared::cluster` bulk-copy destinations reserve 3.6 GB of stack
+  memory; use `.shared::cta`.

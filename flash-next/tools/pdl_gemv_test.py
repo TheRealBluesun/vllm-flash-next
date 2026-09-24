@@ -65,6 +65,14 @@ def bench(fn, reps=5):
 
 
 torch.manual_seed(0)
+# warm the CUDA GEMV variants (lazy module loading needs free VRAM)
+for _n, _k, _fp8 in ((16384, 2560, 1), (2560, 6144, 1), (336, 10240, 0), (10240, 320, 0)):
+    for _m in (1, 5, 16, 20, 64, 65):
+        _w = torch.zeros(_n, _k, device="cuda", dtype=torch.bfloat16)
+        _s = torch.ones(-(-_n // 128), _k // 128, device="cuda") if _fp8 else None
+        pg._launch(torch.zeros(_m, _k, device="cuda", dtype=torch.bfloat16), _w.to(torch.float8_e4m3fn) if _fp8 else _w, _s, 0)
+        pg._launch(torch.zeros(_m, _k, device="cuda", dtype=torch.bfloat16), _w.to(torch.float8_e4m3fn) if _fp8 else _w, _s, 1)
+del _w; torch.cuda.synchronize(); torch.cuda.empty_cache()
 rel = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm()).item()
 layers = [L(N, K, k, keep_ref=(i == 0)) for i in range(24) for (_, N, K, k) in SHAPES]
 for Lx in layers[:4]:

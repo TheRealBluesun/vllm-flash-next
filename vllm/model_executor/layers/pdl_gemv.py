@@ -33,7 +33,7 @@ _BLOCK = 128  # FP8 block-scale granularity
 def _pdl_gemv_kernel(
     x_ptr, w_ptr, s_ptr, acc_ptr, cnt_ptr, y_ptr, M, N, K, stride_xm, stride_ym, stride_s,
     FP8: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr, SPLIT: tl.constexpr, SBLK: tl.constexpr,
+    BLOCK_K: tl.constexpr, SPLIT: tl.constexpr, SBLK: tl.constexpr, EVICT: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -42,7 +42,15 @@ def _pdl_gemv_kernel(
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
     wmask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
     # 1) weights (and scales) first: independent of the previous kernel
-    w = tl.load(w_ptr + offs_n[:, None] * K + offs_k[None, :], mask=wmask, other=0.0)
+    # EVICT: L2 policy for the weights. 1 = evict_first (streamed once per step),
+    # 2 = evict_last (reused within a step, e.g. the MTP draft layer's 4 passes).
+    wp = w_ptr + offs_n[:, None] * K + offs_k[None, :]
+    if EVICT == 1:
+        w = tl.load(wp, mask=wmask, other=0.0, eviction_policy="evict_first")
+    elif EVICT == 2:
+        w = tl.load(wp, mask=wmask, other=0.0, eviction_policy="evict_last")
+    else:
+        w = tl.load(wp, mask=wmask, other=0.0)
     if FP8:
         # one scale per (row block, 128-wide K block): [BLOCK_N, BLOCK_K // SBLK]
         offs_kb = pid_k * (BLOCK_K // SBLK) + tl.arange(0, BLOCK_K // SBLK)
@@ -100,7 +108,49 @@ def _workspace(device: torch.device):
     return ws
 
 
-def _launch(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor | None) -> torch.Tensor:
+_SMS: int | None = None
+_CUDA_OK: bool | None = None
+
+
+def _cuda_gemv(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor | None, evict: int):
+    """VLLM_PDL_GEMV_CUDA: TMA + mma kernel (pdl_ext/gemv_tma.cu); None if not applicable.
+
+    Measured (24-layer chains, M=5): qkvz 89% of DRAM roofline (Triton 78%), out 80% (77),
+    HC down 77% (71), HC up 97% (74). It loses at M > 8 on few-row layers, so those stay on
+    the Triton kernel."""
+    global _SMS, _CUDA_OK
+    if _CUDA_OK is None:
+        import vllm.envs as envs
+
+        _CUDA_OK = False
+        if envs.VLLM_PDL_GEMV_CUDA:
+            from vllm.model_executor.layers import pdl_ext
+
+            _CUDA_OK = pdl_ext.load()
+            _SMS = torch.cuda.get_device_properties(x.device).multi_processor_count
+    if not _CUDA_OK:
+        return None
+    m, k = x.shape
+    n = w.shape[0]
+    fp8 = s is not None
+    rows = 64 if -(-n // 64) >= 128 else 16 if -(-n // 16) >= 128 else 8
+    if (m > 16 or (m > 8 and rows != 64) or k % 64 or x.stride(0) % 8
+            or x.data_ptr() % 16 or not w.is_contiguous()):
+        return None
+    gran = 128 if fp8 else 64
+    tiles = -(-n // rows)
+    splits = max(1, min(2 * _SMS // tiles, k // 1024))  # <= resident CTAs (2/SM)
+    k_cta = -(-(-(-k // splits)) // gran) * gran
+    acc, cnt = _workspace(x.device)
+    y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
+    torch.ops.flashnext_pdl.gemv_tma(x, w, s if fp8 else w, acc, cnt, y, k_cta, int(evict == 1), rows)
+    return y
+
+
+def _launch(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor | None, evict: int = 0) -> torch.Tensor:
+    y = _cuda_gemv(x, w, s, evict)
+    if y is not None:
+        return y
     m, k = x.shape
     n = w.shape[0]
     fp8 = s is not None
@@ -113,10 +163,21 @@ def _launch(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor | None) -> torch.T
     _pdl_gemv_kernel[(tiles, split)](
         x, w, s if fp8 else w, acc, cnt, y, m, n, k, x.stride(0), y.stride(0),
         s.stride(0) if fp8 else 0,
-        FP8=fp8, BLOCK_M=block_m, BLOCK_N=bn, BLOCK_K=bk, SPLIT=split, SBLK=_BLOCK,
+        FP8=fp8, BLOCK_M=block_m, BLOCK_N=bn, BLOCK_K=bk, SPLIT=split, SBLK=_BLOCK, EVICT=evict,
         num_warps=warps, num_stages=1, launch_pdl=True,
     )
     return y
+
+
+def evict_policy(layer) -> int:
+    """VLLM_L2_DRAFT: target weights stream through L2 with evict_first so the MTP
+    draft layer's weights (marked ``_pdl_draft``) stay L2-resident across the
+    draft passes of a step. 0 = default policy."""
+    import vllm.envs as envs
+
+    if not envs.VLLM_L2_DRAFT or getattr(layer, "_pdl_draft", False):
+        return 0
+    return 1
 
 
 def _usable(x: torch.Tensor, n: int) -> bool:
@@ -126,19 +187,19 @@ def _usable(x: torch.Tensor, n: int) -> bool:
 # --------------------------------------------------------------------------- FP8
 def _pdl_fp8_impl(
     x: torch.Tensor, w8: torch.Tensor, s: torch.Tensor, marlin_w: torch.Tensor,
-    marlin_s: torch.Tensor, workspace: torch.Tensor, size_n: int, size_k: int,
+    marlin_s: torch.Tensor, workspace: torch.Tensor, size_n: int, size_k: int, evict: int = 0,
 ) -> torch.Tensor:
     if _usable(x, size_n):
         if x.stride(1) != 1:
             x = x.contiguous()
-        return _launch(x, w8, s)
+        return _launch(x, w8, s, evict)
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear)
     return apply_fp8_marlin_linear(input=x, weight=marlin_w, weight_scale=marlin_s,
                                    workspace=workspace, size_n=size_n, size_k=size_k, bias=None)
 
 
-def _pdl_fp8_fake(x, w8, s, marlin_w, marlin_s, workspace, size_n, size_k):
+def _pdl_fp8_fake(x, w8, s, marlin_w, marlin_s, workspace, size_n, size_k, evict=0):
     return x.new_empty((x.shape[0], size_n))
 
 
@@ -158,21 +219,22 @@ def pdl_fp8_apply(layer, x, marlin_scale, bias):
     lead = x.shape[:-1]
     y = torch.ops.vllm.pdl_fp8_block_linear(
         x.reshape(-1, x.shape[-1]), layer._pdl_w8, layer._pdl_s, layer.weight, marlin_scale,
-        layer.workspace, layer.output_size_per_partition, layer.input_size_per_partition)
+        layer.workspace, layer.output_size_per_partition, layer.input_size_per_partition,
+        evict_policy(layer))
     y = y.reshape(*lead, y.shape[-1])
     return y if bias is None else y + bias
 
 
 # --------------------------------------------------------------------------- BF16
-def _pdl_bf16_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _pdl_bf16_impl(x: torch.Tensor, weight: torch.Tensor, evict: int = 0) -> torch.Tensor:
     if _usable(x, weight.shape[0]):
         if x.stride(1) != 1:
             x = x.contiguous()
-        return _launch(x, weight, None)
+        return _launch(x, weight, None, evict)
     return torch.nn.functional.linear(x, weight)
 
 
-def _pdl_bf16_fake(x, weight):
+def _pdl_bf16_fake(x, weight, evict=0):
     return x.new_empty((x.shape[0], weight.shape[0]))
 
 
@@ -180,7 +242,7 @@ direct_register_custom_op(op_name="pdl_bf16_gemv", op_func=_pdl_bf16_impl,
                           fake_impl=_pdl_bf16_fake)
 
 
-def pdl_bf16_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def pdl_bf16_linear(x: torch.Tensor, weight: torch.Tensor, evict: int = 0) -> torch.Tensor:
     lead = x.shape[:-1]
-    y = torch.ops.vllm.pdl_bf16_gemv(x.reshape(-1, x.shape[-1]), weight)
+    y = torch.ops.vllm.pdl_bf16_gemv(x.reshape(-1, x.shape[-1]), weight, evict)
     return y.reshape(*lead, weight.shape[0])

@@ -17,6 +17,8 @@ from collections.abc import Iterable
 
 import regex as re
 import torch
+
+import vllm.envs as envs
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -256,6 +258,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             "mlp",
         )
 
+        if envs.VLLM_L2_DRAFT:
+            # Draft weights keep the default L2 policy; target GEMVs use evict_first
+            # (pdl_gemv.evict_policy), so these stay L2-resident across draft passes.
+            for m in self.modules():
+                m._pdl_draft = True
         self.pre_fc_norm_embedding = GemmaRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
