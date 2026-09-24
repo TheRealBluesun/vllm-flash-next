@@ -5,6 +5,7 @@
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
@@ -22,6 +23,7 @@ from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
 )
+from vllm.v1.ple_offload import prefetch as ple_prefetch
 from vllm.v1.ple_offload.protocol import (
     PleOffloadRegistration,
     PleOffloadRequest,
@@ -37,6 +39,13 @@ class _PendingPleOffloadRequest:
 
     request: PleOffloadRequest
     d2h_done_event: torch.cuda.Event
+
+
+@dataclass
+class _PendingPleOffloadHint:
+    """Prefetch-only prompt hint; needs no staged inputs or D2H event."""
+
+    request: PleOffloadRequest
 
 
 def _cuda_check(result: Any, operation: str) -> Any:
@@ -97,11 +106,14 @@ class PleOffloadConnector:
         self._validate_input_sources()
 
         self._pinned_input_buffers: list[torch.Tensor] = []
-        self._request_queue: queue.Queue[_PendingPleOffloadRequest | None] = (
+        self._request_queue: queue.Queue[
+            _PendingPleOffloadRequest | _PendingPleOffloadHint | None
+        ] = (
             queue.Queue(maxsize=vllm_config.max_concurrent_batches)
         )
         self._request_thread: threading.Thread | None = None
         self._request_thread_ready = threading.Event()
+        self._d2h_wait_sum, self._d2h_wait_n = 0.0, 0
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
         self._d2h_event_pool: queue.Queue[torch.cuda.Event] | None = None
@@ -281,6 +293,9 @@ class PleOffloadConnector:
                 request = self._request_queue.get()
                 if request is None:
                     return
+                if isinstance(request, _PendingPleOffloadHint):
+                    socket.send(msgspec.msgpack.encode(request.request))
+                    continue
                 self._process_request(request, socket)
         except Exception:
             logger.exception("PLE request thread failed")
@@ -298,8 +313,17 @@ class PleOffloadConnector:
         event_pool = self._d2h_event_pool
         event = pending.d2h_done_event
         assert event_pool is not None, "PLE D2H event pool is not initialized"
+        t0 = time.perf_counter()
         with torch.accelerator.device_index(self.device.index):
             event.synchronize()
+        if ple_prefetch.TIMING_ENABLED:
+            request.t_send = time.perf_counter()
+            self._d2h_wait_sum += request.t_send - t0
+            self._d2h_wait_n += 1
+            if self._d2h_wait_n >= 200:
+                logger.info("PLE connector: D2H+event wait %.3f ms/request",
+                            self._d2h_wait_sum / self._d2h_wait_n * 1e3)
+                self._d2h_wait_sum, self._d2h_wait_n = 0.0, 0
 
         socket.send(msgspec.msgpack.encode(request))
         event_pool.put_nowait(event)
@@ -390,6 +414,25 @@ class PleOffloadConnector:
         self._request_queue.put_nowait(
             _PendingPleOffloadRequest(request, d2h_done_event)
         )
+
+    def hint_prompt(self, token_ids: list[int]) -> None:
+        """Let the CPU worker prefetch PLE rows for upcoming prefill tokens."""
+        if (
+            self.tp_rank != 0
+            or not ple_prefetch.PREFILL_HINT_ENABLED
+            or len(token_ids) < ple_prefetch.PREFILL_HINT_MIN_TOKENS
+        ):
+            return
+        request = PleOffloadRequest(
+            dp_rank=self.dp_rank,
+            num_tokens=0,
+            num_reqs=0,
+            hint_token_ids=list(token_ids),
+        )
+        try:
+            self._request_queue.put_nowait(_PendingPleOffloadHint(request))
+        except queue.Full:
+            pass  # hints are best-effort
 
     def prepare_forward(
         self,

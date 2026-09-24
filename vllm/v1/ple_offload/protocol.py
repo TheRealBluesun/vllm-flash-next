@@ -35,6 +35,12 @@ class PleOffloadRequest:
     dp_rank: int
     num_tokens: int
     num_reqs: int
+    # Prefill hint (num_tokens == 0): upcoming prompt tokens whose PLE rows
+    # the CPU worker may prefetch from swap ahead of the real requests.
+    hint_token_ids: list[int] | None = None
+    # time.perf_counter() at send (VLLM_PLE_TIMING); CLOCK_MONOTONIC is shared
+    # across processes, so the CPU worker can measure IPC latency.
+    t_send: float = 0.0
 
 
 _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)

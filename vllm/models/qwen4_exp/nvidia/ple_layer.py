@@ -4,6 +4,9 @@
 
 from collections.abc import Iterable, Sequence
 
+import os
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -28,6 +31,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.v1.ple_offload import prefetch as ple_prefetch
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4Config,
@@ -552,6 +556,68 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
+    _NP_MAX_TOKENS = 256
+
+    def _compute_ngram_ids_np(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """NumPy twin of the offload-process CPU path below, for decode-sized
+        batches: same math, ~5x less per-op overhead than ~30 tiny torch ops.
+        Must stay bit-identical to the torch path (see test_ple_np_ids)."""
+        np_params = getattr(self, "_np_ngram_params", None)
+        if np_params is None:
+            np_params = (
+                self.layer_multipliers.cpu().numpy().astype(np.int64),
+                self.ngram_heads_vocab_sizes.cpu().numpy().astype(np.int64),
+                self.ngram_heads_offsets.cpu().numpy().astype(np.int64),
+            )
+            self._np_ngram_params = np_params
+        mult, sizes_all, offs_all = np_params
+        eos = self.eos_token_id
+        ids = input_ids.reshape(-1).numpy().astype(np.int64, copy=False)
+        qsl = query_start_loc.numpy().astype(np.int64, copy=False)
+        num_reqs = qsl.shape[0] - 1
+        num_tokens = ids.shape[0]
+        max_seq_len = max(1, int((qsl[1:] - qsl[:-1]).max()))
+        num_valid = min(int(qsl[-1]), num_tokens)
+        positions = np.arange(num_tokens, dtype=np.int64)
+        packed = np.full((num_reqs, max_seq_len), eos, dtype=np.int64)
+        req_idx = np.searchsorted(qsl, positions, side="right") - 1
+        np.minimum(req_idx, num_reqs - 1, out=req_idx)
+        columns = np.clip(positions - qsl[req_idx], 0, max_seq_len - 1)
+        packed[req_idx[:num_valid], columns[:num_valid]] = ids[:num_valid]
+        ctx = ngram_context[:num_reqs].numpy().astype(np.int64, copy=False)
+        context = np.concatenate([ctx, packed], axis=1)
+        seq = context.shape[1]
+        pos = np.arange(seq, dtype=np.int64)
+        eos_pos = np.where(context == eos, pos, -1)
+        prev_incl = np.maximum.accumulate(eos_pos, axis=1)
+        prev = np.concatenate(
+            [np.full((num_reqs, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1
+        )
+        in_seg = pos[None, :] - prev - 1
+        shifted = [context]
+        for shift in range(1, self.ngram_size):
+            src = pos - shift
+            gathered = context[:, np.maximum(src, 0)]
+            valid = (src[None, :] >= 0) & (in_seg >= shift)
+            shifted.append(np.where(valid, gathered, eos))
+        adj = columns + self.ngram_size - 1
+        blocks = []
+        with np.errstate(over="ignore"):
+            for ngram in range(2, self.ngram_size + 1):
+                start = (ngram - 2) * self.heads_per_ngram
+                end = start + self.heads_per_ngram
+                mixed = shifted[0] * mult[0]
+                for index in range(1, ngram):
+                    mixed = np.bitwise_xor(mixed, shifted[index] * mult[index])
+                sel = mixed[req_idx, adj]
+                blocks.append(np.remainder(sel[:, None], sizes_all[start:end]) + offs_all[start:end])
+        return torch.from_numpy(np.concatenate(blocks, axis=-1))
+
     def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
@@ -560,6 +626,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute n-gram embedding indices for the current request layout."""
+        if (
+            not input_ids.is_cuda
+            and is_offload_process()
+            and input_ids.numel() <= self._NP_MAX_TOKENS
+            and os.environ.get("VLLM_PLE_NP_IDS", "0") == "1"
+            and query_start_loc.numel() > 1
+        ):
+            return self._compute_ngram_ids_np(input_ids, query_start_loc, ngram_context)
         input_ids = input_ids.reshape(-1)
         num_reqs = query_start_loc.numel() - 1
         num_tokens = input_ids.shape[0]
@@ -652,6 +726,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del hidden_states
+        timer = None if input_ids.is_cuda else ple_prefetch.gather_timer
         if input_ids.is_cuda:
             # Keep request-dependent ID generation outside piecewise graphs.
             ngram_ids = input_ids.new_empty(
@@ -665,6 +740,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.layer_name,
             )
         else:
+            if timer is not None:
+                t0, f0 = timer.now(), timer.majflt()
             ngram_ids = self.compute_ngram_ids(
                 input_ids,
                 query_start_loc,
@@ -679,12 +756,24 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 output.copy_(self.ngram_embedding(ngram_ids).flatten(-2))
                 return output
             output = output_buffer[:num_tokens, : self.embedding_dim]
+            flat_ids = ngram_ids.reshape(-1)
+            weight = self.ngram_embedding.weight
+            if not weight.is_cuda:
+                if timer is not None:
+                    t1 = timer.now()
+                ple_prefetch.prefetch_rows(weight, flat_ids)
+                if timer is not None:
+                    t2 = timer.now()
             torch.index_select(
-                self.ngram_embedding.weight,
+                weight,
                 0,
-                ngram_ids.reshape(-1),
+                flat_ids,
                 out=output.reshape(-1, self.head_dim),
             )
+            if timer is not None and not weight.is_cuda:
+                t3 = timer.now()
+                timer.add(flat_ids.numel(), t1 - t0, t2 - t1, t3 - t2,
+                          timer.majflt() - f0)
             return output
         return self.ngram_embedding(ngram_ids).flatten(-2)
 

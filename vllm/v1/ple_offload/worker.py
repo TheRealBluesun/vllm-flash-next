@@ -22,9 +22,11 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 import contextlib
 import multiprocessing.process
 import pickle
+import queue
 import signal
 import tempfile
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -57,6 +59,7 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.ple_offload import prefetch as ple_prefetch
 from vllm.v1.ple_offload.protocol import (
     _PLE_OFFLOAD_REQUEST_DECODER,
     PleOffloadRegistration,
@@ -341,6 +344,47 @@ class PleOffloadRunner:
         # Shared-memory inputs are registered once per DP rank by TP rank zero.
         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
         self._load_weights()
+        self._hint_queue: queue.Queue[list[int] | None] = queue.Queue(maxsize=64)
+        self._e2e_stats: list = [0.0, 0.0, 0]
+        self._hint_thread: threading.Thread | None = None
+        if ple_prefetch.PREFILL_HINT_ENABLED and ple_prefetch.PREFETCH_ENABLED:
+            self._hint_thread = threading.Thread(
+                target=self._hint_loop, name="ple-prefill-hint", daemon=True
+            )
+            self._hint_thread.start()
+
+    _HINT_WINDOW = 4096
+
+    @torch.inference_mode()
+    def _hint_loop(self) -> None:
+        """Prefetch PLE rows for admitted prompts, window by window."""
+        while True:
+            token_ids = self._hint_queue.get()
+            if token_ids is None:
+                return
+            try:
+                self._prefetch_prompt(token_ids)
+            except Exception:
+                logger.exception("PLE prefill hint failed; ignoring")
+
+    def _prefetch_prompt(self, token_ids: list[int]) -> None:
+        tokens = torch.tensor(token_ids, dtype=torch.long)
+        for layer in self._layers.values():
+            weight = getattr(getattr(layer, "ngram_embedding", None), "weight", None)
+            compute = getattr(layer, "compute_ngram_ids", None)
+            if weight is None or weight.is_cuda or compute is None:
+                continue
+            n_ctx = int(layer.ngram_size) - 1
+            eos = int(layer.eos_token_id)
+            for start in range(0, tokens.numel(), self._HINT_WINDOW):
+                window = tokens[start : start + self._HINT_WINDOW]
+                if start >= n_ctx:
+                    context = tokens[start - n_ctx : start].reshape(1, n_ctx)
+                else:
+                    context = torch.full((1, n_ctx), eos, dtype=torch.long)
+                qsl = torch.tensor([0, window.numel()], dtype=torch.long)
+                ids = compute(window, qsl, context)
+                ple_prefetch.prefetch_rows(weight, ids.reshape(-1))
 
     @property
     def layer_names(self) -> list[str]:
@@ -610,6 +654,15 @@ class PleOffloadRunner:
             except msgspec.DecodeError as error:
                 raise RuntimeError("Unexpected PLE offload request") from error
 
+            hints = [r for r in requests if r.hint_token_ids is not None]
+            if hints:
+                requests = [r for r in requests if r.hint_token_ids is None]
+                for hint in hints:
+                    with contextlib.suppress(queue.Full):
+                        self._hint_queue.put_nowait(hint.hint_token_ids)
+                if not requests:
+                    continue
+
             self._handle_requests(requests)
 
     def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
@@ -619,6 +672,23 @@ class PleOffloadRunner:
 
     def _handle_requests_impl(self, requests: list[PleOffloadRequest]) -> None:
         """Process one batch of PLE requests."""
+        t_recv = time.perf_counter()
+        try:
+            self._handle_requests_core(requests)
+        finally:
+            if ple_prefetch.TIMING_ENABLED and requests and requests[0].t_send:
+                t_done = time.perf_counter()
+                st = self._e2e_stats
+                st[0] += t_recv - requests[0].t_send
+                st[1] += t_done - t_recv
+                st[2] += 1
+                if st[2] >= 200:
+                    logger.info(
+                        "PLE worker: IPC latency %.3f ms | handle (incl. H2D enqueue) %.3f ms",
+                        st[0] / st[2] * 1e3, st[1] / st[2] * 1e3)
+                    st[:] = [0.0, 0.0, 0]
+
+    def _handle_requests_core(self, requests: list[PleOffloadRequest]) -> None:
         requests_by_dp: dict[int, PleOffloadRequest] = {}
         for request in requests:
             if request.dp_rank not in self._worker_targets:
