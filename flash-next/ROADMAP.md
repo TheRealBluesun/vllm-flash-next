@@ -18,9 +18,10 @@ sampling + inter-graph gaps ~1.5.
 | 2 | MTP k=5 | `BLOCK_SIZE=48` makes the hybrid attention block 1632 so ring capacity 12 divides it | 0–4% | hours | none | **tested 2026-09-24: no net gain on chat** (accept +8%, step +9%; code +4%). Kept k=4; `BLOCK_SIZE` knob stays in the serve script |
 | 3 | 4-bit dense layers (online) | online MXFP4 (`DENSE_QUANT_SCHEME=mxfp4`; the only online 4-bit scheme) instead of FP8 | +7% measured | hours | **+7–9% ppl measured** | **rejected 2026-09-24** |
 | 3b | Calibrated NVFP4 dense layers (offline) | ModelOpt calibration of the dense projections to NVFP4, like the experts; new checkpoint | ~5–7% | days | unknown; likely ~1% ppl, needs NLL | idea |
-| 4 | Fused hyper-connection block | 1–2 Triton kernels per sublayer instead of ~7 (96 sublayers/step) | 6–8% | days | low (test vs reference) | |
-| 5 | Fused MoE routing | top-k + align + sort + sum (~236 kernels/step) | 3–4% | days | low | |
-| 6 | VRAM hot-row cache for PLE | 1–2 GB of the most-used rows on GPU; misses go via CPU/swap | 4–6% | days | none (costs KV) | |
+| 4 | Fused hyper-connection block | 1–2 Triton kernels per sublayer instead of ~7 (96 sublayers/step) | 7–9% (re-profile: ~1.85 ms on critical path) | days | low (test vs reference) | **top priority** |
+| 5 | Fused MoE routing | top-k + align + sort + sum (~236 kernels/step) | ~1% (re-profile: only 0.17 ms critical; it overlaps the GEMMs) | days | low | deprioritized |
+| 6 | VRAM hot-row cache for PLE | 1–2 GB of the most-used rows on GPU; misses go via CPU/swap | 6–8% (re-profile: PLE stall still 1.12 ms/step) | days | none (costs KV) | **second priority** |
+| 6b | FP8 experts for the MTP draft layer | online FP8 MoE for `mtp.*` experts only (ignore the NVFP4 target experts); draft-only | ~2% (draft MoE is 0.5 ms/step) | hours | none (drafts are verified) | cheap, try first |
 | 7 | Sampling/rejection in CUDA graphs | cut ~1.5 ms of eager work + gaps | 3–5% | days | none | |
 | 8 | Better drafter (EAGLE-3/DFlash-style, trained on own traffic) | +0.3 accepted tokens/step ≈ +9%; prose accepts only ~2.4 today | 10–30% | weeks | none | |
 | 9 | Megakernel (persistent decoder-layer kernel) | route to 70–80% of roofline | up to 30–40% | months | none | |
@@ -29,6 +30,15 @@ Prefill: FlashInfer CUTLASS NVFP4 MoE gives +12% prefill but −11% decode, and 
 expert layouts (63 GB) can't coexist, so expect only ~5–10% more without new kernels.
 
 Stacking 1–7 realistically takes decode from ~13 → ~10–11 ms/step (+20–30%).
+
+## Re-profile 2026-09-24 (prof6, current config)
+Critical-path attribution (GPU-busy time that disappears if a category costs 0; summed kernel
+times double-count overlapped streams): dense FP8 2.16 · idle 2.01 (PLE stall 1.12) · MoE 1.92 ·
+HC mixers 1.34 + helpers 0.34 + split-K reduce ~0.18 · FP8 lm_head 1.04 · GDN 0.55 ·
+draft MoE 0.50 · other BF16 0.45 · shared experts 0.38 · elementwise 0.35 · QSA 0.26 ·
+MoE routing 0.17 · norms 0.12 (ms/step, under nsys: 13.8 ms/step vs ~12.6 normally).
+The big "elementwise" item (a MulFunctor at 18 µs) is the shared-expert gate multiply running in
+parallel with the MoE GEMM, so it's ~free.
 
 ## Side fixes
 - 2026-09-24: online FP8 was also quantizing the **vision tower** (Marlin pads its K=4304).
