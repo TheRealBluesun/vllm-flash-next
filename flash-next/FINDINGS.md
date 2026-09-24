@@ -156,3 +156,14 @@ happened only while an instance was still starting up or had crashed.
   in `vllm/envs.py`. The final config was verified on a fresh cache:
   greedy chat 266–279, sampled 238–258, NLL long +0.41% / short −0.02%, stress OK,
   pure decode 245/372/558 tok/s at C=1/2/4.
+
+## 2026-09-24 follow-ups
+- `vm.page-cluster=0` (user): 16K prefill 1.33 → 1.27 s; decode change within noise.
+- MTP k=5 via `BLOCK_SIZE=48` (attention block 1616 → 1632): accepted tokens +8% but step
+  time +9%, so chat is flat (greedy 262–274 vs 267–276, sampled 235–252 vs 240–254), code +4%,
+  prefill slightly worse. Kept k=4.
+- Online MXFP4 dense (`DENSE_QUANT_SCHEME=mxfp4`, Marlin W4A16): chat 293–295 tok/s (+7%) but
+  NLL +9.1% long / +7% short. Rejected. The weight-key form `{"weight":"mxfp4"}` fails
+  (it maps to the dynamic key); the scheme shorthand works. The vision tower needs `*visual*` in
+  the ignore list (K=4304 isn't a multiple of 32).
+- Found: the FP8 config had been quantizing the vision tower too. Now excluded; image test OK.
