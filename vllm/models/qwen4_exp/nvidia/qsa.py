@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import ClassVar, cast
 
+import os
+
 import torch
 from torch import nn
 
@@ -239,7 +241,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=model.without_modelopt_fp4(quant_config),
+            # The checkpoint's exclude list ("*.self_attn.*") already keeps this
+            # out of NVFP4; passing the config through lets online dense quant
+            # (--quantization-config.linear) cover it (VLLM_QSA_QKV_ONLINE_QUANT=1).
+            quant_config=(
+                quant_config
+                if os.environ.get("VLLM_QSA_QKV_ONLINE_QUANT", "0") == "1"
+                else model.without_modelopt_fp4(quant_config)
+            ),
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
