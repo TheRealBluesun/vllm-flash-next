@@ -38,6 +38,9 @@ class PleOffloadRequest:
     # Prefill hint (num_tokens == 0): upcoming prompt tokens whose PLE rows
     # the CPU worker may prefetch from swap ahead of the real requests.
     hint_token_ids: list[int] | None = None
+    # Decode hint (num_tokens == 0): per request [num_sampled, bonus, d1..dj]
+    # sent after each draft pass so the next step's rows swap in early.
+    decode_hint: list[list[int]] | None = None
     # time.perf_counter() at send (VLLM_PLE_TIMING); CLOCK_MONOTONIC is shared
     # across processes, so the CPU worker can measure IPC latency.
     t_send: float = 0.0

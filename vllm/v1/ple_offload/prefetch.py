@@ -30,6 +30,8 @@ TIMING_ENABLED = os.environ.get("VLLM_PLE_TIMING", "0") == "1"
 # prefill chunks find their rows already swapped in.
 PREFILL_HINT_ENABLED = os.environ.get("VLLM_PLE_PREFILL_HINT", "0") == "1"
 PREFILL_HINT_MIN_TOKENS = 2048
+# Prefetch rows for the next decode step while the MTP drafts are generated.
+DRAFT_HINT_ENABLED = os.environ.get("VLLM_PLE_DRAFT_HINT", "0") == "1"
 
 _MADV_WILLNEED = 3
 _SYS_PROCESS_MADVISE = 440  # x86_64

@@ -344,10 +344,12 @@ class PleOffloadRunner:
         # Shared-memory inputs are registered once per DP rank by TP rank zero.
         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
         self._load_weights()
-        self._hint_queue: queue.Queue[list[int] | None] = queue.Queue(maxsize=64)
+        self._hint_queue: queue.Queue = queue.Queue(maxsize=64)
         self._e2e_stats: list = [0.0, 0.0, 0]
         self._hint_thread: threading.Thread | None = None
-        if ple_prefetch.PREFILL_HINT_ENABLED and ple_prefetch.PREFETCH_ENABLED:
+        if ple_prefetch.PREFETCH_ENABLED and (
+            ple_prefetch.PREFILL_HINT_ENABLED or ple_prefetch.DRAFT_HINT_ENABLED
+        ):
             self._hint_thread = threading.Thread(
                 target=self._hint_loop, name="ple-prefill-hint", daemon=True
             )
@@ -359,13 +361,51 @@ class PleOffloadRunner:
     def _hint_loop(self) -> None:
         """Prefetch PLE rows for admitted prompts, window by window."""
         while True:
-            token_ids = self._hint_queue.get()
-            if token_ids is None:
+            item = self._hint_queue.get()
+            if item is None:
                 return
+            kind, payload = item
             try:
-                self._prefetch_prompt(token_ids)
+                if kind == "prompt":
+                    self._prefetch_prompt(payload)
+                else:
+                    self._prefetch_decode(*payload)
             except Exception:
-                logger.exception("PLE prefill hint failed; ignoring")
+                logger.exception("PLE %s hint failed; ignoring", kind)
+
+    def _prefetch_decode(self, dp_rank: int, rows: list[list[int]]) -> None:
+        """Prefetch rows for the next decode step's known tokens.
+
+        ``rows[r] = [num_sampled, bonus, d1..dj]`` for request r of the current
+        step. The shared input buffers still hold the current step's inputs, so
+        the history tail is ngram_context + accepted inputs + bonus + drafts.
+        Advisory only: a stale or mismatched context just prefetches the wrong
+        pages.
+        """
+        bufs = self._input_bufs.get(dp_rank)
+        if bufs is None or bufs.ngram_context_buf is None:
+            return
+        n = len(rows)
+        qsl = bufs.query_start_loc_buf[: n + 1].tolist()
+        for layer in self._layers.values():
+            weight = getattr(getattr(layer, "ngram_embedding", None), "weight", None)
+            compute = getattr(layer, "compute_ngram_ids", None)
+            if weight is None or weight.is_cuda or compute is None:
+                continue
+            n_ctx = int(layer.ngram_size) - 1
+            for r, row in enumerate(rows):
+                num_sampled, window = int(row[0]), [int(t) for t in row[1:]]
+                if num_sampled < 1 or r + 1 >= len(qsl):
+                    continue
+                seq = bufs.input_ids_buf[qsl[r] : qsl[r + 1]].tolist()
+                # Decode steps verify 1 + k tokens (k <= ~8); prefill chunks are long.
+                accepted = seq[:num_sampled] if len(seq) <= 16 else seq
+                ctx = bufs.ngram_context_buf[r, :n_ctx].tolist()
+                tail = [max(t, 0) for t in ctx + accepted]
+                context = torch.tensor(tail[-n_ctx:], dtype=torch.long).reshape(1, n_ctx)
+                win = torch.tensor([max(t, 0) for t in window], dtype=torch.long)
+                ids = compute(win, torch.tensor([0, win.numel()], dtype=torch.long), context)
+                ple_prefetch.prefetch_rows(weight, ids.reshape(-1))
 
     def _prefetch_prompt(self, token_ids: list[int]) -> None:
         tokens = torch.tensor(token_ids, dtype=torch.long)
@@ -654,12 +694,23 @@ class PleOffloadRunner:
             except msgspec.DecodeError as error:
                 raise RuntimeError("Unexpected PLE offload request") from error
 
-            hints = [r for r in requests if r.hint_token_ids is not None]
+            hints = [
+                r for r in requests
+                if r.hint_token_ids is not None or r.decode_hint is not None
+            ]
             if hints:
-                requests = [r for r in requests if r.hint_token_ids is None]
+                requests = [
+                    r for r in requests
+                    if r.hint_token_ids is None and r.decode_hint is None
+                ]
                 for hint in hints:
+                    item = (
+                        ("prompt", hint.hint_token_ids)
+                        if hint.hint_token_ids is not None
+                        else ("decode", (hint.dp_rank, hint.decode_hint))
+                    )
                     with contextlib.suppress(queue.Full):
-                        self._hint_queue.put_nowait(hint.hint_token_ids)
+                        self._hint_queue.put_nowait(item)
                 if not requests:
                     continue
 

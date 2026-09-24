@@ -400,6 +400,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_source=query_start_loc_source,
             ngram_context_source=ngram_context_source,
         )
+        if getattr(self, "speculator", None) is not None:
+            self.speculator.ple_connector = self._ple_offload_connector
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()

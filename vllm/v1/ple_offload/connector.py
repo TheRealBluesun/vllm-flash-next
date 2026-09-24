@@ -48,6 +48,16 @@ class _PendingPleOffloadHint:
     request: PleOffloadRequest
 
 
+@dataclass
+class _PendingPleDecodeHint:
+    """Draft-pass hint: pinned [num_reqs, 2 + j] rows ready once ``event`` fires."""
+
+    slot: torch.Tensor
+    event: torch.cuda.Event
+    num_reqs: int
+    width: int
+
+
 def _cuda_check(result: Any, operation: str) -> Any:
     """Check the ``(CUresult, ...)`` tuple returned by cuda-python calls."""
     error = result[0] if isinstance(result, tuple) else result
@@ -107,13 +117,21 @@ class PleOffloadConnector:
 
         self._pinned_input_buffers: list[torch.Tensor] = []
         self._request_queue: queue.Queue[
-            _PendingPleOffloadRequest | _PendingPleOffloadHint | None
+            _PendingPleOffloadRequest
+            | _PendingPleOffloadHint
+            | _PendingPleDecodeHint
+            | None
         ] = (
-            queue.Queue(maxsize=vllm_config.max_concurrent_batches)
+            # Real requests are bounded by the D2H event pool; the extra room is
+            # for best-effort prefetch hints.
+            queue.Queue(maxsize=vllm_config.max_concurrent_batches + 16)
         )
         self._request_thread: threading.Thread | None = None
         self._request_thread_ready = threading.Event()
         self._d2h_wait_sum, self._d2h_wait_n = 0.0, 0
+        self._draft_hint_slots: list[torch.Tensor] | None = None
+        self._draft_hint_events: queue.Queue | None = None
+        self._draft_hint_next = 0
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
         self._d2h_event_pool: queue.Queue[torch.cuda.Event] | None = None
@@ -296,6 +314,15 @@ class PleOffloadConnector:
                 if isinstance(request, _PendingPleOffloadHint):
                     socket.send(msgspec.msgpack.encode(request.request))
                     continue
+                if isinstance(request, _PendingPleDecodeHint):
+                    with torch.accelerator.device_index(self.device.index):
+                        request.event.synchronize()
+                    rows = request.slot[: request.num_reqs, : request.width].tolist()
+                    socket.send(msgspec.msgpack.encode(PleOffloadRequest(
+                        dp_rank=self.dp_rank, num_tokens=0, num_reqs=0, decode_hint=rows,
+                    )))
+                    self._draft_hint_events.put_nowait(request.event)
+                    continue
                 self._process_request(request, socket)
         except Exception:
             logger.exception("PLE request thread failed")
@@ -433,6 +460,49 @@ class PleOffloadConnector:
             self._request_queue.put_nowait(_PendingPleOffloadHint(request))
         except queue.Full:
             pass  # hints are best-effort
+
+    def hint_draft(
+        self,
+        num_reqs: int,
+        num_sampled: torch.Tensor,
+        last_sampled: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        num_drafts: int,
+    ) -> None:
+        """Stage [num_sampled, bonus, d1..d_num_drafts] per request (async D2H)."""
+        if self.tp_rank != 0 or not ple_prefetch.DRAFT_HINT_ENABLED or num_reqs == 0:
+            return
+        logger.info_once("PLE draft hints active (prefetching next-step rows during drafting)")
+        if self._draft_hint_slots is None:
+            max_reqs = self._query_start_loc_buf.shape[0] - 1
+            width = 2 + draft_tokens.shape[1]
+            self._draft_hint_slots = [
+                torch.zeros(max_reqs, width, dtype=torch.int64, pin_memory=True)
+                for _ in range(8)
+            ]
+            self._draft_hint_events = queue.Queue()
+            for _ in range(8):
+                self._draft_hint_events.put_nowait(torch.cuda.Event())
+            self._draft_hint_next = 0
+        try:
+            event = self._draft_hint_events.get_nowait()
+        except queue.Empty:
+            return  # hints are best-effort
+        slot = self._draft_hint_slots[self._draft_hint_next]
+        self._draft_hint_next = (self._draft_hint_next + 1) % len(self._draft_hint_slots)
+        with torch.accelerator.device_index(self.device.index):
+            slot[:num_reqs, 0].copy_(num_sampled[:num_reqs], non_blocking=True)
+            slot[:num_reqs, 1].copy_(last_sampled[:num_reqs].reshape(-1), non_blocking=True)
+            slot[:num_reqs, 2 : 2 + num_drafts].copy_(
+                draft_tokens[:num_reqs, :num_drafts], non_blocking=True
+            )
+            event.record(torch.cuda.current_stream(self.device))
+        try:
+            self._request_queue.put_nowait(
+                _PendingPleDecodeHint(slot, event, num_reqs, 2 + num_drafts)
+            )
+        except queue.Full:
+            self._draft_hint_events.put_nowait(event)
 
     def prepare_forward(
         self,

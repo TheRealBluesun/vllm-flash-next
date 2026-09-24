@@ -319,6 +319,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 mm_inputs=mm_inputs,
             )
         self.on_prefill_end(num_reqs)
+        # PLE draft hints (advisory prefetch for the next target step).
+        self._ple_hint_state = None
+        ple_connector = getattr(self, "ple_connector", None)
+        if ple_connector is not None and not dummy_run and not is_profile:
+            self._ple_hint_state = (ple_connector, num_reqs, num_sampled, last_sampled)
+            if self.num_speculative_steps > 1:
+                ple_connector.hint_draft(
+                    num_reqs, num_sampled, last_sampled, self.draft_tokens, 1
+                )
 
         if self.num_speculative_steps == 1:
             # Early exit.
@@ -530,6 +539,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
+            hint = getattr(self, "_ple_hint_state", None)
+            if hint is not None and step < self.num_speculative_steps - 1:
+                connector, n_reqs, n_sampled, last = hint
+                connector.hint_draft(n_reqs, n_sampled, last, self.draft_tokens, step + 1)
 
     def _fused_multi_step_decode(
         self,
