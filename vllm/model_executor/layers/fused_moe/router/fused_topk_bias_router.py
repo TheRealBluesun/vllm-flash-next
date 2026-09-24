@@ -184,6 +184,10 @@ def fused_topk_bias(
         token_expert_indices = torch.empty(
             M, topk, dtype=torch.int32, device=hidden_states.device
         )
+        if envs.VLLM_FUSED_ROUTE:
+            from vllm.model_executor.layers.fused_moe.flashnext_route import forget
+
+            forget(topk_ids)
 
         if scoring_func == "softmax":
             topk_weights, topk_ids = vllm_topk_softmax(

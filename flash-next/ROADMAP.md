@@ -19,7 +19,7 @@ sampling + inter-graph gaps ~1.5.
 | 3 | 4-bit dense layers (online) | online MXFP4 (`DENSE_QUANT_SCHEME=mxfp4`; the only online 4-bit scheme) instead of FP8 | +7% measured | hours | **+7–9% ppl measured** | **rejected 2026-09-24** |
 | 3b | Calibrated NVFP4 dense layers (offline) | ModelOpt calibration of the dense projections to NVFP4, like the experts; new checkpoint | ~5–7% | days | unknown; likely ~1% ppl, needs NLL | idea |
 | 4 | Fused hyper-connection block | K1: split-K down+inject GEMM with last-CTA silu; K2c: stream-split up GEMM + sigmoid + gated mean (atomics) | **prototype: 1.21× on HC → ~0.3 ms/step (~2–3%)**; hand-written CUDA at ~80% BW might reach ~5% | days | low (numerics match: 0 at M=1, ~2e-3 at M=5–16) | **integrated as `VLLM_HC_FUSED` (off)**: 1.14× in isolation, but no measurable gain in the server, within noise → left off |
-| 5 | Fused MoE routing | `pdl_ext/moe_route.cu`: one 1024-thread CTA does softmax top-k (warp per token, `redux.sync` arg-max on float-bit keys) + the full `moe_align_block_size` layout (counts, padded scan, expert ids, scatter), padding-row aware, PDL; `fused_topk` stashes the align outputs and `moe_align_block_size` takes them on an exact (buffer, block size, E) match | 7.4 → 3.7 µs/layer isolated; **server −0.2 ms/step (~2%)**: corpus 11.71–11.87 → 11.57–11.69, chat 11.50–11.54 → 11.25–11.34 | ~1.5 h | none: ids/weights/src rows/segments match the reference exactly; short NLL +0.13/+0.28% (unchanged) | **adopted 2026-09-24** (`VLLM_FUSED_ROUTE=1`) |
+| 5 | Fused MoE routing | `pdl_ext/moe_route.cu`: one 1024-thread CTA does softmax top-k (warp per token, `redux.sync` arg-max on float-bit keys) + the full `moe_align_block_size` layout (counts, padded scan, expert ids, scatter), padding-row aware, PDL; top-k runs as a registered custom op (`vllm.flashnext_fused_topk_softmax`, so tracing can't bake in the reference path), which records the align layout under the topk_ids buffer address; `moe_align_block_size` takes it on an exact (address, shape, block size, E) match, and the non-fused path invalidates its address | 7.4 → 3.7 µs/layer isolated; **server −0.2 ms/step (~2%)**: corpus 11.71–11.87 → 11.57–11.69, chat 11.50–11.54 → 11.25–11.34 | ~1.5 h | none: ids/weights/src rows/segments match the reference exactly; short NLL +0.13/+0.28/+0.54/+0.39% (mean +0.34 vs +0.31 before: noise) | **adopted 2026-09-24** (`VLLM_FUSED_ROUTE=1`) |
 | 6 | VRAM hot-row cache for PLE | 1–2 GB of the most-used rows on GPU; misses go via CPU/swap | **~0 for chat**: a step skips the CPU only if all ~80 rows hit, and even an unbounded seen-before cache gives zero-miss steps 4.6% (chat) / 36% (code); novel 2/3-grams dominate (`tools/ple_cache_sim.py`) | — | none | **rejected 2026-09-24** |
 | 6c | Progressive PLE prefetch hints during drafting | `VLLM_PLE_DRAFT_HINT=1`: after each draft pass, hint the next step's known tokens to the PLE worker | **no gain measured**: gather wait didn't drop (0.54–0.57 vs 0.23–0.48 ms), probably GIL contention with the real request; the remainder is likely DRAM/TLB misses, not swap | ~1 h | none (advisory) | **off 2026-09-24** |
 | 6b | FP8 for the MTP draft layer (dense + experts) | the draft's quant config never got --quantization-config; `VLLM_DRAFT_ONLINE_QUANT=1` attaches the target's online spec + FP8-block experts (target NVFP4 untouched) | **+3% measured** (12.6 → 12.3 ms/step; sampled chat 240–254 → 252–266) | ~30 min | none (drafts are verified) | **adopted 2026-09-24** |
@@ -130,6 +130,15 @@ small elementwise ~0.2.
   survive in context. Stays off.
 - Bigger remaining levers: MoE routing fusion (~0.68 ms of 5 serialized kernels × 48), idle (PLE ~1.1 +
   launch gaps ~0.9, see #7), hc_combine_norm (0.45, fuse into the preceding kernel).
+
+### #5 notes
+- Verified on the GPU (prof9): `moe_route_kernel` 52.6/step, `topkGating` / `moe_align` / `count_and_sort` 0/step in decode.
+- Gotchas hit on the way: (1) a module-global stash was fragile; (2) the Python router can be traced by
+  torch.compile, so an `is_compiling()` guard silently selects the reference path in the compiled graph —
+  make such decisions inside a custom op; (3) vLLM's AOT compile cache is keyed on config + registered env
+  vars, not source, so after changing traced code move `/opt/d/caches/vllm/torch_compile_cache` aside;
+  (4) INFO logs emitted during CUDA-graph capture don't show up, so "never logged" ≠ "never ran" — check
+  kernels in a profile.
 
 ## Side fixes
 - 2026-09-24: online FP8 was also quantizing the **vision tower** (Marlin pads its K=4304).
