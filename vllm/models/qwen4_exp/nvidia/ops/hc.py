@@ -4,9 +4,15 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+# VLLM_PDL_GEMV: trigger dependents right after gdc_wait, so a following PDL GEMV
+# streams its weights while these small kernels run (dependents still wait for
+# our completion before reading our outputs).
+_EARLY_PDL_TRIGGER = tl.constexpr(envs.VLLM_PDL_GEMV)
 
 
 @triton.jit
@@ -38,6 +44,8 @@ def _grouped_gemma_rmsnorm_kernel(
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
+        if _EARLY_PDL_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
 
     x = tl.load(x_ptr + row * stride_x + offsets, mask, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + w_offs, mask, other=0.0)
@@ -96,6 +104,8 @@ def _hc_silu_kernel(
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
+        if _EARLY_PDL_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
 
     x = tl.load(x_ptr + row * stride_x + offs, mask).to(tl.float32) / HC
     y = x * tl.sigmoid(x)
@@ -144,6 +154,8 @@ def _hc_gate_mix_kernel(
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
+        if _EARLY_PDL_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # The constexpr loop is unrolled and keeps one stream live at a time.
     # Materializing [HC, BLOCK_SIZE] more than doubles latency at large M.
@@ -214,6 +226,8 @@ def _hc_combine_kernel(
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
+        if _EARLY_PDL_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
 
     if inj_ptr is not None:
         inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
@@ -308,6 +322,8 @@ def _hc_combine_norm_kernel(
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
+        if _EARLY_PDL_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # Start the uncached residual load first, then issue the other combine
     # loads before consuming any of them.

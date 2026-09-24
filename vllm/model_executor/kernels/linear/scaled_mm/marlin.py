@@ -72,6 +72,10 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             # Update layer with new values
             replace_parameter(layer, "weight", weight.data)
             replace_parameter(layer, scale_name, weight_scale.data)
+            if envs.VLLM_PDL_GEMV:
+                from vllm.model_executor.layers.pdl_gemv import keep_fp8_block_copy
+
+                keep_fp8_block_copy(layer, weight.data, weight_scale.data)
         # Non-block: callers must pass weight in (K, N) layout.
 
         layer.input_scale = None
@@ -90,6 +94,10 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             weight_scale = getattr(layer, self._block_scale_name(layer))
         else:
             weight_scale = layer.weight_scale
+        if getattr(layer, "_pdl_w8", None) is not None:
+            from vllm.model_executor.layers.pdl_gemv import pdl_fp8_apply
+
+            return pdl_fp8_apply(layer, x, weight_scale, bias)
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,

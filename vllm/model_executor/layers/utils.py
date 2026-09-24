@@ -572,6 +572,10 @@ def dispatch_unquantized_gemm(
 
     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
     if backend_spec is None:
+        if os.environ.get("VLLM_PDL_GEMV", "0") == "1":
+            from vllm.model_executor.layers.narrow_gemm import pdl_unquantized_gemm
+
+            return pdl_unquantized_gemm
         if os.environ.get("VLLM_NARROW_GEMM", "0") == "1":
             from vllm.model_executor.layers.narrow_gemm import narrow_unquantized_gemm
 

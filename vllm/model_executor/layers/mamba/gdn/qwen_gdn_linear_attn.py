@@ -381,6 +381,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         reduce_results: bool = True,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        if envs.VLLM_PDL_GEMV and current_platform.is_cuda():
+            from vllm.model_executor.layers import pdl_ext
+
+            pdl_ext.load()  # build/load once, outside any traced region
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -1763,7 +1767,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
-        ops.fused_gdn_decode_post_conv_mtp(
+        post_conv = ops.fused_gdn_decode_post_conv_mtp
+        if envs.VLLM_PDL_GEMV:
+            from vllm.model_executor.layers import pdl_ext
+
+            if pdl_ext.load():
+                post_conv = _pdl_post_conv
+        post_conv(
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
@@ -2072,3 +2082,12 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
+
+
+def _pdl_post_conv(*, out, **kw):
+    """VLLM_PDL_GEMV: same kernel, but it triggers PDL at its start (pdl_ext)."""
+    torch.ops.flashnext_pdl.gdn_post_conv_mtp(
+        kw["mixed_qkv"], kw["a"], kw["b"], kw["A_log"], kw["dt_bias"], kw["state_indices"],
+        kw["cu_seqlens"], kw["num_accepted_tokens"], kw["state"], kw["output_gate"],
+        kw["norm_weight"], out, kw["scale"], kw["norm_eps"], kw["output_gate_activation"])
+    return out

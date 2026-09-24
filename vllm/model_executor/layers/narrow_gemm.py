@@ -110,6 +110,29 @@ def narrow_unquantized_gemm(
     return y.reshape(*lead, weight.shape[0])
 
 
+
+def pdl_unquantized_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """VLLM_PDL_GEMV: narrow layers (N <= NARROW_MAX_N) keep the split-K narrow
+    kernel if VLLM_NARROW_GEMM is also set; wider BF16 layers use the PDL GEMV."""
+    if (
+        bias is not None
+        or weight.dim() != 2
+        or weight.dtype != torch.bfloat16
+        or x.dtype != torch.bfloat16
+        or weight.stride(1) != 1
+    ):
+        return torch.nn.functional.linear(x, weight, bias)
+    if weight.shape[0] <= NARROW_MAX_N and os.environ.get("VLLM_NARROW_GEMM", "0") == "1":
+        return narrow_unquantized_gemm(layer, x, weight, bias)
+    from vllm.model_executor.layers.pdl_gemv import pdl_bf16_linear
+
+    return pdl_bf16_linear(x, weight)
+
 # ---------------------------------------------------------------------------
 # Opt-in FP8 (per-row scale) copies for small BF16 layers at decode sizes.
 # VLLM_SMALL_FP8_LAYERS: comma-separated fnmatch patterns on the layer prefix,

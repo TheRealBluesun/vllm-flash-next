@@ -179,3 +179,7 @@ happened only while an instance was still starting up or had crashed.
 - 7 scoped only: ~0.9 ms/step of CPU-launch gaps in eager sampling/rejection/draft-prep sections.
 - Long-passage NLL noise is ~±0.2% run to run (seen +0.58 and +0.87 on configs with the same
   target math).
+- 10 (hand-written kernels, level 1) adopted as `VLLM_PDL_GEMV=1`: PDL weight-prefetch split-K
+  GEMV for FP8 dense + wide BF16 linears, early PDL triggers in the HC kernels, PDL copy of the
+  GDN post-conv kernel. −0.5/−0.8 ms/step (corpus/chat), C=1/2/4 270/427/595 tok/s, NLL within
+  noise, −2.7 GB KV. Details in ROADMAP.md (#10).
