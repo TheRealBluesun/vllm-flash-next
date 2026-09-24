@@ -5,6 +5,8 @@ from abc import abstractmethod
 from collections.abc import Callable, Iterable
 from typing import Any
 
+import os
+
 import torch
 from torch.nn.parameter import Parameter
 from typing_extensions import TypeIs
@@ -203,6 +205,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if current_platform.is_cuda() and os.environ.get("VLLM_SMALL_FP8_LAYERS"):
+            from vllm.model_executor.layers.narrow_gemm import maybe_add_small_fp8_copy
+
+            maybe_add_small_fp8_copy(layer)
         if current_platform.is_cpu():
             # MLA's kv_b_proj (see `_cpu_skip_gemm_dispatch`): not
             # perf-critical, so skip packing and use a plain fallback.
@@ -235,6 +241,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ):
             return linear_batch_invariant(x, layer.weight, bias)
+        if getattr(layer, "_w8a16_w", None) is not None:
+            from vllm.model_executor.layers.narrow_gemm import small_fp8_apply
+
+            return small_fp8_apply(layer, x, bias)
         return self._gemm_impl(layer, x, layer.weight, bias)
 
 
