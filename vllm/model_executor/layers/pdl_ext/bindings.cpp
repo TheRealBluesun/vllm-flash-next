@@ -19,7 +19,18 @@ void flashnext_gemv_tma(torch::stable::Tensor const& x, torch::stable::Tensor co
                         torch::stable::Tensor& cnt, torch::stable::Tensor& y, int64_t k_cta,
                         int64_t evict_first, int64_t rows_per_cta);
 
+void flashnext_moe_route(torch::stable::Tensor const& logits, torch::stable::Tensor& w_out,
+                         torch::stable::Tensor& id_out, torch::stable::Tensor& src_out,
+                         torch::stable::Tensor& sorted_ids, torch::stable::Tensor& expert_ids,
+                         torch::stable::Tensor& num_post_pad, int64_t topk, bool renormalize,
+                         int64_t block_size, torch::stable::Tensor const& is_padding,
+                         bool has_padding);
+
 STABLE_TORCH_LIBRARY(flashnext_pdl, ops) {
+  ops.def(
+      "moe_route(Tensor logits, Tensor! w, Tensor! ids, Tensor! src, Tensor! sorted_ids, "
+      "Tensor! expert_ids, Tensor! num_post_pad, int topk, bool renormalize, int block_size, "
+      "Tensor is_padding, bool has_padding) -> ()");
   ops.def(
       "gemv_tma(Tensor x, Tensor w, Tensor s, Tensor! acc, Tensor! cnt, Tensor! y, "
       "int k_cta, int evict_first, int rows_per_cta) -> ()");
@@ -35,4 +46,5 @@ STABLE_TORCH_LIBRARY(flashnext_pdl, ops) {
 STABLE_TORCH_LIBRARY_IMPL(flashnext_pdl, CUDA, ops) {
   ops.impl("gdn_post_conv_mtp", TORCH_BOX(&flashnext_gdn_post_conv_pdl));
   ops.impl("gemv_tma", TORCH_BOX(&flashnext_gemv_tma));
+  ops.impl("moe_route", TORCH_BOX(&flashnext_moe_route));
 }

@@ -71,6 +71,11 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    from vllm.model_executor.layers.fused_moe.flashnext_route import take_aligned
+
+    pre = take_aligned(topk_ids, block_size, num_experts, expert_map, pad_sorted_ids)
+    if pre is not None:
+        return pre
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)

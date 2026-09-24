@@ -89,6 +89,15 @@ def fused_topk(
 
     M, _ = hidden_states.size()
 
+    if scoring_func == "softmax" and not rocm_aiter_ops.is_fused_moe_enabled():
+        from vllm.model_executor.layers.fused_moe.flashnext_route import (
+            try_fused_topk_softmax,
+        )
+
+        fused = try_fused_topk_softmax(gating_output, topk, renormalize, indices_type)
+        if fused is not None:
+            return fused
+
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device
     )

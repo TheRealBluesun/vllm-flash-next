@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Runtime-built CUDA ops for VLLM_PDL_GEMV (torch.ops.flashnext_pdl.*).
 
+- moe_route: fused softmax top-k + moe_align_block_size for decode (VLLM_FUSED_ROUTE).
 - gemv_tma: CUDA decode GEMV (TMA weight ring + mma), VLLM_PDL_GEMV_CUDA.
 - gdn_post_conv_mtp: a copy of the fused GDN decode post-conv kernel that triggers
 programmatic dependent launch at its start, so out_proj's PDL GEMV streams its
@@ -20,7 +21,7 @@ _CSRC = os.path.normpath(os.path.join(_DIR, "..", "..", "..", "..", "csrc"))
 
 @cache
 def load() -> bool:
-    if hasattr(torch.ops, "flashnext_pdl") and hasattr(torch.ops.flashnext_pdl, "gemv_tma"):
+    if hasattr(torch.ops, "flashnext_pdl") and hasattr(torch.ops.flashnext_pdl, "moe_route"):
         return True
     from torch.utils.cpp_extension import load as _load
 
@@ -31,7 +32,7 @@ def load() -> bool:
     _load(
         name="flashnext_pdl",
         sources=[os.path.join(_DIR, "bindings.cpp"), os.path.join(_DIR, "gdn_post_conv_pdl.cu"),
-                 os.path.join(_DIR, "gemv_tma.cu")],
+                 os.path.join(_DIR, "gemv_tma.cu"), os.path.join(_DIR, "moe_route.cu")],
         extra_include_paths=[_CSRC],
         extra_cflags=["-O3", "-DUSE_CUDA", "-DTORCH_TARGET_VERSION=0x020B000000000000ULL"],
         extra_cuda_cflags=["-O3", "-DUSE_CUDA", "-DTORCH_TARGET_VERSION=0x020B000000000000ULL",
@@ -41,4 +42,4 @@ def load() -> bool:
         is_python_module=False,
         verbose=False,
     )
-    return hasattr(torch.ops.flashnext_pdl, "gemv_tma")
+    return hasattr(torch.ops.flashnext_pdl, "moe_route")

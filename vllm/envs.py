@@ -1234,6 +1234,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PDL_GEMV": lambda: os.getenv("VLLM_PDL_GEMV", "0") == "1",
     "VLLM_L2_DRAFT": lambda: os.getenv("VLLM_L2_DRAFT", "0") == "1",
     "VLLM_PDL_GEMV_CUDA": lambda: os.getenv("VLLM_PDL_GEMV_CUDA", "0") == "1",
+    "VLLM_FUSED_ROUTE": lambda: os.getenv("VLLM_FUSED_ROUTE", "0") == "1",
     "VLLM_DISABLED_KERNELS": lambda: (
         []
         if "VLLM_DISABLED_KERNELS" not in os.environ

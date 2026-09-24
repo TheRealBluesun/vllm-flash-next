@@ -188,3 +188,6 @@ happened only while an instance was still starting up or had crashed.
   qkvz/out/HC-down/HC-up vs Triton 78/77/71/74) but no server gain because most neighbours aren't
   PDL-chained; off. sm_120 gotcha: `.shared::cluster` bulk-copy destinations reserve 3.6 GB of stack
   memory; use `.shared::cta`.
+- 5 adopted (`VLLM_FUSED_ROUTE=1`): fused softmax top-k + moe_align in one CTA (pdl_ext/moe_route.cu),
+  exact routing, −0.2 ms/step (chat ~11.3 ms/step). Phase timing showed top-k was the cost (3.2 µs);
+  contiguous per-lane experts + vector loads + redux.sync arg-max brought it to ~1.9 µs.
