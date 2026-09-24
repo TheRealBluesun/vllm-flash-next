@@ -140,6 +140,21 @@ small elementwise ~0.2.
   (4) INFO logs emitted during CUDA-graph capture don't show up, so "never logged" ≠ "never ran" — check
   kernels in a profile.
 
+## Idle / PLE breakdown (2026-09-24 evening, prof9 + VLLM_PLE_TIMING)
+- GPU idle ~1.9 ms/step, of which **~0.93 ms is one gap per step: the PLE stall** (graph waits in
+  `cuStreamWaitValue32` at the start of the target forward for the CPU worker's rows). The rest is many
+  small gaps (<0.06 ms/step each).
+- PLE worker per decode request (steady state, ~87 rows): IPC 0.07 · n-gram ids 0.16 → **0.07 with
+  `VLLM_PLE_PY_IDS=1`** (adopted, bit-identical) · madvise prefetch 0.10 · gather 0.07 · handle 0.44 → ~0.33 ms.
+  The remaining ~0.5 ms is hops: D2H + event → connector thread → zmq → worker → H2D + semaphore.
+- Skipping the prefetch for small requests (`VLLM_PLE_PREFETCH_MIN_ROWS`) helps warm chat (handle 0.22 ms)
+  but cold corpus n-grams then fault serially (15–17 majflt/call, gather ~1.7 ms): off.
+- Progressive row delivery during drafting (a real version of 6c) would still leave the fixed hop costs on
+  the critical path for the last draft token; the better lever is cutting hops (e.g. worker polls a
+  GPU-written host flag instead of connector thread + zmq).
+- The non-PDL `elementwise_kernel` → GEMV break is on the shared-expert aux stream (s166), which runs in
+  parallel with the routed Marlin MoE and isn't on the critical path: no gain.
+
 ## Side fixes
 - 2026-09-24: online FP8 was also quantizing the **vision tower** (Marlin pads its K=4304).
   `*visual*` is now in `DENSE_QUANT_IGNORE`, so vision is back to BF16 (+0.6 GB). Image test OK.
