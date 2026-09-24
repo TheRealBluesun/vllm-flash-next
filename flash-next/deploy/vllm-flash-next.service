@@ -1,0 +1,30 @@
+[Unit]
+Description=vLLM Qwen3.8-Flash-Next (NVFP4, PLE CPU offload) on :8000
+After=network-online.target
+Wants=network-online.target
+# Each start loads ~48 GiB of PLE table; don't crash-loop forever.
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/d/vllm-flash-next-0906
+# Driver can lag login right after boot; the serve script needs nvidia-smi.
+ExecStartPre=/bin/bash -c 'for i in $(seq 60); do nvidia-smi -L >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+# A previous instance (48 GB swapped + CUDA context) can take minutes to finish
+# exiting even after SIGKILL; wait for its VRAM instead of failing the start.
+ExecStartPre=/bin/bash -c 'for i in $(seq 180); do m=$(nvidia-smi -i GPU-REPLACE-WITH-YOUR-UUID --query-gpu=memory.used --format=csv,noheader,nounits | tr -d " "); [ "$m" -lt 4096 ] && exit 0; sleep 1; done; echo "GPU still busy"; exit 1'
+ExecStart=/opt/d/vllm-flash-next-0906/serve-qwen38-flash-next.sh
+Restart=on-failure
+RestartSec=30
+# SIGINT is ignored mid-startup; SIGTERM to the whole cgroup stops API server,
+# EngineCore, GPU worker and the PLE offload worker.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStartSec=infinity
+TimeoutStopSec=90
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
