@@ -618,6 +618,71 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 blocks.append(np.remainder(sel[:, None], sizes_all[start:end]) + offs_all[start:end])
         return torch.from_numpy(np.concatenate(blocks, axis=-1))
 
+    _PY_MAX_TOKENS = 32
+
+    def _compute_ngram_ids_py(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pure-Python twin of _compute_ngram_ids_np for decode batches (<= 32 tokens,
+        VLLM_PLE_PY_IDS=1): computes only the context positions each output token needs,
+        so it skips ~30 NumPy calls. Bit-identical: products wrap to int64 before the XOR,
+        and Python's % equals np.remainder for positive moduli (see test_ple_np_ids)."""
+        np_params = getattr(self, "_py_ngram_params", None)
+        if np_params is None:
+            mult = [int(v) for v in self.layer_multipliers.cpu().tolist()]
+            sizes = [int(v) for v in self.ngram_heads_vocab_sizes.cpu().tolist()]
+            offs = [int(v) for v in self.ngram_heads_offsets.cpu().tolist()]
+            np_params = (mult, sizes, offs)
+            self._py_ngram_params = np_params
+        mult, sizes, offs = np_params
+        eos = self.eos_token_id
+        n_ctx = self.ngram_size - 1
+        hpn = self.heads_per_ngram
+        mask64, top = (1 << 64) - 1, 1 << 63
+        ids = input_ids.reshape(-1).tolist()
+        qsl = query_start_loc.tolist()
+        num_reqs = len(qsl) - 1
+        num_tokens = len(ids)
+        max_seq = max(1, max(qsl[i + 1] - qsl[i] for i in range(num_reqs)))
+        num_valid = min(qsl[-1], num_tokens)
+        ctx = ngram_context[:num_reqs].tolist()
+        rows: dict[int, list[int]] = {}
+        out = []
+        r = 0
+        for t in range(num_tokens):
+            while r + 1 < num_reqs and qsl[r + 1] <= t:
+                r += 1
+            col = min(max(t - qsl[r], 0), max_seq - 1)
+            row = rows.get(r)
+            if row is None:
+                packed = [eos] * max_seq
+                for u in range(qsl[r], min(qsl[r + 1], num_valid)):
+                    packed[u - qsl[r]] = ids[u]
+                row = rows[r] = list(ctx[r]) + packed
+            p = col + n_ctx
+            # shifted[s] = row[p - s] while no EOS lies in row[p - s .. p - 1], else EOS
+            shifted = [row[p]]
+            ok = True
+            for sft in range(1, self.ngram_size):
+                q = p - sft
+                if ok and (q < 0 or row[q] == eos):
+                    ok = False
+                shifted.append(row[q] if ok else eos)
+            token_ids = []
+            mixed = 0
+            for n in range(self.ngram_size):
+                v = (shifted[n] * mult[n]) & mask64
+                mixed ^= v - (1 << 64) if v >= top else v
+                if n >= 1:
+                    start = (n - 1) * hpn
+                    for h in range(start, start + hpn):
+                        token_ids.append(mixed % sizes[h] + offs[h])
+            out.append(token_ids)
+        return torch.tensor(out, dtype=torch.int64)
+
     def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
@@ -626,6 +691,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute n-gram embedding indices for the current request layout."""
+        if (
+            not input_ids.is_cuda
+            and is_offload_process()
+            and input_ids.numel() <= self._PY_MAX_TOKENS
+            and os.environ.get("VLLM_PLE_PY_IDS", "0") == "1"
+            and query_start_loc.numel() > 1
+        ):
+            return self._compute_ngram_ids_py(input_ids, query_start_loc, ngram_context)
         if (
             not input_ids.is_cuda
             and is_offload_process()
@@ -761,7 +834,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             if not weight.is_cuda:
                 if timer is not None:
                     t1 = timer.now()
-                ple_prefetch.prefetch_rows(weight, flat_ids)
+                if flat_ids.numel() >= ple_prefetch.PREFETCH_MIN_ROWS:
+                    ple_prefetch.prefetch_rows(weight, flat_ids)
                 if timer is not None:
                     t2 = timer.now()
             torch.index_select(

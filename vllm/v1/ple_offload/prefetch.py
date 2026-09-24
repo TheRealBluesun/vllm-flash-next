@@ -26,6 +26,9 @@ logger = init_logger(__name__)
 
 PREFETCH_ENABLED = os.environ.get("VLLM_PLE_PREFETCH", "0") == "1"
 TIMING_ENABLED = os.environ.get("VLLM_PLE_TIMING", "0") == "1"
+# Skip the madvise prefetch for small (decode) gathers: once the hot rows are resident the
+# syscall costs more than the gather. Prefill-sized gathers still prefetch. 0 = always.
+PREFETCH_MIN_ROWS = int(os.environ.get("VLLM_PLE_PREFETCH_MIN_ROWS", "0"))
 # Prefetch rows for whole prompts as soon as a request is admitted, so later
 # prefill chunks find their rows already swapped in.
 PREFILL_HINT_ENABLED = os.environ.get("VLLM_PLE_PREFILL_HINT", "0") == "1"

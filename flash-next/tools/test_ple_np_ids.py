@@ -16,8 +16,8 @@ o.layer_multipliers = torch.tensor(mults); o.ngram_heads_vocab_sizes = torch.ten
 V = int(tc["vocab_size"]); rng = random.Random(0); n_ctx = o.ngram_size - 1
 def rand_tokens(n):
     return [o.eos_token_id if rng.random() < 0.08 else rng.randrange(V) for _ in range(n)]
-t_np = t_torch = 0.0; cases = 0
-for trial in range(3000):
+t_np = t_torch = t_py = 0.0; cases = 0
+for trial in range(int(os.environ.get('TRIALS', '6000'))):
     num_reqs = rng.randint(1, 4); lens = [rng.randint(1, 8) for _ in range(num_reqs)]
     qsl = [0]; [qsl.append(qsl[-1] + l) for l in lens]
     pad = rng.choice([0, 0, rng.randint(1, 6)])  # CUDA-graph padding past the valid tokens
@@ -26,7 +26,10 @@ for trial in range(3000):
     q = torch.tensor(qsl, dtype=torch.int32)
     os.environ["VLLM_PLE_NP_IDS"] = "0"; t0 = time.perf_counter(); ref = o.compute_ngram_ids(ids, q, ctx); t_torch += time.perf_counter() - t0
     os.environ["VLLM_PLE_NP_IDS"] = "1"; t0 = time.perf_counter(); got = o.compute_ngram_ids(ids, q, ctx); t_np += time.perf_counter() - t0
+    os.environ["VLLM_PLE_PY_IDS"] = "1"; t0 = time.perf_counter(); gpy = o.compute_ngram_ids(ids, q, ctx); t_py += time.perf_counter() - t0
+    os.environ["VLLM_PLE_PY_IDS"] = "0"
+    assert ref.shape == gpy.shape and ref.dtype == gpy.dtype and torch.equal(ref, gpy), f"py mismatch trial {trial}: lens={lens} pad={pad}\n{ref}\n{gpy}"
     assert ref.shape == got.shape and ref.dtype == got.dtype, (ref.shape, got.shape, ref.dtype, got.dtype)
     assert torch.equal(ref, got), f"mismatch trial {trial}: lens={lens} pad={pad}"
     cases += 1
-print(f"{cases} random layouts identical; torch {t_torch/cases*1e3:.3f} ms/call vs numpy {t_np/cases*1e3:.3f} ms/call")
+print(f"{cases} random layouts identical; torch {t_torch/cases*1e3:.3f} | numpy {t_np/cases*1e3:.3f} | python {t_py/cases*1e3:.3f} ms/call")
