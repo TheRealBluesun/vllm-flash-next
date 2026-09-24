@@ -167,3 +167,15 @@ happened only while an instance was still starting up or had crashed.
   (it maps to the dynamic key); the scheme shorthand works. The vision tower needs `*visual*` in
   the ignore list (K=4304 isn't a multiple of 32).
 - Found: the FP8 config had been quantizing the vision tower too. Now excluded; image test OK.
+
+## 2026-09-24 round 2 (6b, 4, 6c, 7)
+- 6b adopted: the draft (MTP) layer had no online quant at all (its quant config is rebuilt from
+  the draft model config without --quantization-config). `VLLM_DRAFT_ONLINE_QUANT=1` gives it FP8
+  dense + FP8-block experts (Triton FP8 MoE). Warm: greedy chat 275–288, sampled 259–269 tok/s.
+- 4: `VLLM_HC_FUSED` op (ops/hc_fused.py) is correct (bf16-rounding-level diffs; atomics make
+  it non-bit-deterministic) and 1.14× in isolation, but no measurable server gain. Off.
+- 6 rejected by simulation (`tools/ple_cache_sim.py`): chat steps are almost never all-hit.
+- 6c `VLLM_PLE_DRAFT_HINT`: hints fire, but no gain. Off.
+- 7 scoped only: ~0.9 ms/step of CPU-launch gaps in eager sampling/rejection/draft-prep sections.
+- Long-passage NLL noise is ~±0.2% run to run (seen +0.58 and +0.87 on configs with the same
+  target math).
