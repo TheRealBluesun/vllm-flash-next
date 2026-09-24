@@ -113,6 +113,24 @@ residency), then #9 (megakernel) — each moves the step closer to one continuou
   in the decode path most GEMVs border inductor elementwise kernels or Marlin MoE. Next lever: fuse or
   PDL-enable those neighbours (or go to #9, the megakernel), then turn this kernel on.
 
+## Re-profile 2026-09-24 afternoon (prof7 current config, prof8 with 10b on)
+Serialized main-stream time per decode step (each kernel charged its non-overlapped part; 12.6 ms/step under nsys):
+PDL GEMVs 3.52 (~406 launches) · Marlin MoE 2.94 (near roofline for the experts touched) · idle 1.96
+(PLE stall + launch gaps) · FP8 heads 1.06 (~87% of roofline) · GDN recurrence 0.72 · MoE routing 0.68
+(topkGating 0.26, align 0.18, count/sort 0.07, act_and_mul 0.08, moe_sum 0.09) · hc_combine_norm 0.45 ·
+small elementwise ~0.2.
+- **The "neighbours break the PDL chain" theory was mostly wrong** (`tools/chain_breaks.py`): 96–100% of GEMVs
+  already start before their predecessor ends, including after inductor kernels. GEMV time is exposed
+  because it streams weights, not because of chain breaks. Remaining breaks: a non-PDL `elementwise_kernel`
+  before ~47 GEMVs/step (~0.4 ms exposed), and non-PDL successors (vectorized_elementwise, topkGating,
+  QSA norm/indexer).
+- 10b on (prof8): all ~500 GEMVs/step dispatched to the CUDA kernel. GEMV time +0.35 ms but hc_combine_norm
+  −0.2 and GDN −0.1 → net ~0. On the real shapes in isolation (`tools/gemv_shapes.py`) CUDA saves ~0.2 ms/step
+  (qkvz 91% vs 82%, qsa qkv 93 vs 84, shared down 87 vs 63; loses on router/indexer), but that doesn't
+  survive in context. Stays off.
+- Bigger remaining levers: MoE routing fusion (~0.68 ms of 5 serialized kernels × 48), idle (PLE ~1.1 +
+  launch gaps ~0.9, see #7), hc_combine_norm (0.45, fuse into the preceding kernel).
+
 ## Side fixes
 - 2026-09-24: online FP8 was also quantizing the **vision tower** (Marlin pads its K=4304).
   `*visual*` is now in `DENSE_QUANT_IGNORE`, so vision is back to BF16 (+0.6 GB). Image test OK.
