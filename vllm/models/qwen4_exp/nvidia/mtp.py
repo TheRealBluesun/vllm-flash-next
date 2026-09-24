@@ -21,6 +21,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.logger import init_logger
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -59,6 +60,9 @@ from .model import (
     Qwen4ExpSparseMoeBlock,
 )
 
+
+
+logger = init_logger(__name__)
 
 def _remap_ignored_layers(
     ignored_layers: list[str],
@@ -108,6 +112,40 @@ def _remap_mtp_weight_name(name: str) -> str | None:
     return None
 
 
+def _maybe_add_draft_online_quant(vllm_config: VllmConfig, draft_quant_config) -> None:
+    """Opt-in (VLLM_DRAFT_ONLINE_QUANT=1): online FP8 for the MTP draft layer.
+
+    The draft's quant config is rebuilt from the draft model config, which does
+    not carry --quantization-config, so the draft layer stays BF16 even when
+    the target's dense layers are online-quantized. Draft numerics only affect
+    acceptance (every draft token is verified), so this also quantizes the
+    draft layer's experts (FP8 128x128 blocks); the target's NVFP4 experts
+    never see this overlay.
+    """
+    import os
+
+    if os.environ.get("VLLM_DRAFT_ONLINE_QUANT", "0") != "1" or draft_quant_config is None:
+        return
+    if getattr(draft_quant_config, "online_quantization_config", None) is not None:
+        return
+    target_args = vllm_config.model_config.quantization_config
+    if target_args is None:
+        return
+    from vllm.config.quantization import QuantSpec
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Static128BlockSym,
+    )
+
+    draft_args = replace(
+        target_args, moe=QuantSpec(weight=kFp8Static128BlockSym, activation=None)
+    )
+    draft_quant_config.online_quantization_config = OnlineQuantizationConfig(draft_args)
+    logger.info("MTP draft layer: online quantization %s", draft_args)
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -136,6 +174,8 @@ def _make_draft_vllm_config(
                 "exclude_modules",
                 _remap_ignored_layers(exclude_modules, mtp_start_layer_idx),
             )
+
+    _maybe_add_draft_online_quant(vllm_config, draft_quant_config)
 
     draft_vllm_config = replace(
         vllm_config,

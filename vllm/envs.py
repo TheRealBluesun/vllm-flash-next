@@ -1228,6 +1228,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NARROW_GEMM": lambda: os.getenv("VLLM_NARROW_GEMM", "0"),
     "VLLM_SMALL_FP8_LAYERS": lambda: os.getenv("VLLM_SMALL_FP8_LAYERS", ""),
     "VLLM_QSA_QKV_ONLINE_QUANT": lambda: os.getenv("VLLM_QSA_QKV_ONLINE_QUANT", "0"),
+    "VLLM_DRAFT_ONLINE_QUANT": lambda: os.getenv("VLLM_DRAFT_ONLINE_QUANT", "0"),
+    "VLLM_HC_FUSED": lambda: os.getenv("VLLM_HC_FUSED", "0"),
+    "VLLM_PLE_DRAFT_HINT": lambda: os.getenv("VLLM_PLE_DRAFT_HINT", "0"),
     "VLLM_DISABLED_KERNELS": lambda: (
         []
         if "VLLM_DISABLED_KERNELS" not in os.environ
