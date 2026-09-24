@@ -75,6 +75,14 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    if speculative_config.moe_backend is not None:
+        vllm_config = replace(
+            vllm_config,
+            kernel_config=replace(
+                vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            ),
+        )
     if speculative_config.kv_cache_dtype is not None:
         vllm_config = replace(
             vllm_config,

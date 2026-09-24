@@ -221,6 +221,20 @@ class PleOffloadConnector:
         )
 
         # ForkingPickler transmits tensors through shared-memory and CUDA IPC.
+        # Yama ptrace_scope=1 (desktop default) blocks sibling pidfd_getfd,
+        # which CUDA IPC uses to import these buffers in the PLE worker.
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        pr_set_ptracer = 0x59616D61  # PR_SET_PTRACER
+        pr_set_ptracer_any = ctypes.c_ulong(-1).value
+        if libc.prctl(pr_set_ptracer, pr_set_ptracer_any) != 0:
+            logger.warning(
+                "prctl(PR_SET_PTRACER, ANY) failed (errno=%s); "
+                "PLE CUDA IPC may hit pidfd_getfd EPERM",
+                ctypes.get_errno(),
+            )
+
         import torch.multiprocessing as torch_mp
 
         original_strategy = torch_mp.get_sharing_strategy()
